@@ -118,6 +118,27 @@ p.description {
 	box-shadow: none;
 }
 
+.button.secondary {
+	background: linear-gradient(135deg, #fbbf24, #f59e0b);
+	color: #78350f;
+	box-shadow: 0 10px 25px rgba(251, 191, 36, 0.35);
+}
+
+.button.secondary:hover:not(:disabled) {
+	box-shadow: 0 12px 28px rgba(251, 191, 36, 0.45);
+}
+
+.button.ghost {
+	background: rgba(226, 232, 240, 0.8);
+	color: #1e293b;
+	box-shadow: none;
+	border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.button.ghost:hover:not(:disabled) {
+	background: rgba(226, 232, 240, 1);
+}
+
 .status {
 	display: inline-flex;
 	align-items: center;
@@ -143,6 +164,11 @@ p.description {
 	color: #b91c1c;
 }
 
+.status.cancelled {
+	background: rgba(148, 163, 184, 0.2);
+	color: #475569;
+}
+
 .jobs-table {
 	width: 100%;
 	border-collapse: collapse;
@@ -162,6 +188,10 @@ p.description {
 	padding: 16px 0;
 	border-top: 1px solid rgba(226, 232, 240, 0.9);
 	color: #1f2937;
+}
+
+.actions-cell {
+	min-width: 180px;
 }
 
 .job-id {
@@ -203,6 +233,17 @@ p.description {
 	text-decoration: underline;
 }
 
+.download-link.muted {
+	opacity: 0.45;
+	cursor: default;
+}
+
+.row-actions {
+	display: flex;
+	gap: 12px;
+	align-items: center;
+}
+
 @media (max-width: 720px) {
 	main {
 		padding: 32px 24px;
@@ -217,6 +258,15 @@ p.description {
 	.actions {
 		flex-direction: column;
 		align-items: stretch;
+	}
+
+	.row-actions {
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.actions-cell {
+		min-width: auto;
 	}
 
 	.button {

@@ -9,17 +9,19 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::extract::multipart::Field;
+use axum::extract::DefaultBodyLimit;
 use axum::{
     body::Bytes,
     extract::{Multipart, Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock};
+use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -38,6 +40,7 @@ struct JobEntry {
     id: Uuid,
     running: bool,
     done: bool,
+    cancelled: bool,
     started_at: DateTime<Utc>,
     started_instant: Instant,
     duration: Option<f64>,
@@ -45,6 +48,7 @@ struct JobEntry {
     log_path: PathBuf,
     job_dir: PathBuf,
     error: Option<String>,
+    cancel_token: Option<CancellationToken>,
 }
 
 #[derive(Serialize)]
@@ -52,6 +56,7 @@ struct JobSummary {
     id: Uuid,
     running: bool,
     done: bool,
+    cancelled: bool,
     start_time: DateTime<Utc>,
     duration_seconds: f64,
     job_type: Option<String>,
@@ -146,7 +151,10 @@ async fn main() -> Result<()> {
     let upload_router = Router::new()
         .route("/upload", post(upload))
         .route("/status", get(status))
-        .route("/download/:id", get(download));
+        .route("/download/:id", get(download))
+        .route("/jobs/:id/cancel", post(cancel_job))
+        .route("/jobs/:id", delete(delete_job))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES));
 
     let static_service = ServeDir::new(frontend_dir.clone())
         .not_found_service(ServeFile::new(frontend_dir.join("index.html")));
@@ -224,10 +232,13 @@ async fn process_inp_upload(
 
     let detected_job_type = detect_job_type(&model_path).await.unwrap_or(None);
 
+    let cancel_token = CancellationToken::new();
+
     let job_entry = JobEntry {
         id: job_id,
         running: true,
         done: false,
+        cancelled: false,
         started_at: Utc::now(),
         started_instant: Instant::now(),
         duration: None,
@@ -235,6 +246,7 @@ async fn process_inp_upload(
         log_path: job_dir.join("solver.log"),
         job_dir: job_dir.clone(),
         error: None,
+        cancel_token: Some(cancel_token.clone()),
     };
 
     {
@@ -242,7 +254,7 @@ async fn process_inp_upload(
         jobs.insert(job_id, job_entry.clone());
     }
 
-    tokio::spawn(run_calculix_job(state, job_id));
+    tokio::spawn(run_calculix_job(state, job_id, cancel_token));
 
     Ok(Json(UploadResponse { id: job_id }))
 }
@@ -266,7 +278,7 @@ async fn detect_job_type(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-async fn run_calculix_job(state: AppState, job_id: Uuid) {
+async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: CancellationToken) {
     let (job_dir, log_path, threads) = {
         let jobs = state.jobs.read().await;
         match jobs.get(&job_id) {
@@ -298,20 +310,50 @@ async fn run_calculix_job(state: AppState, job_id: Uuid) {
             .stderr(Stdio::from(log_file_err));
 
         info!("Starting CalculiX job {job_id}");
-        let status = command.status().await?;
+        let mut child = command
+            .spawn()
+            .context("Failed to spawn CalculiX process")?;
+        let mut cancelled = false;
+
+        let status = tokio::select! {
+            status = child.wait() => {
+                status.context("Failed to wait for CalculiX process")?
+            }
+            _ = cancel_token.cancelled() => {
+                cancelled = true;
+                // Attempt to terminate the process; ignore errors if already exited.
+                if let Err(err) = child.kill().await {
+                    if err.kind() != std::io::ErrorKind::InvalidInput {
+                        error!("Failed to kill CalculiX job {job_id}: {err}");
+                    }
+                }
+                child.wait().await.context("Failed to wait for cancelled CalculiX process")?
+            }
+        };
 
         let mut jobs = state.jobs.write().await;
         if let Some(entry) = jobs.get_mut(&job_id) {
             entry.running = false;
-            entry.done = true;
+            entry.cancel_token = None;
             entry.duration = Some(entry.started_instant.elapsed().as_secs_f64());
-            if !status.success() {
-                entry.error = Some(format!("CalculiX exited with status: {}", status));
-                error!("CalculiX job {job_id} failed: {status}");
-            } else {
+            entry.cancelled = cancelled;
+
+            if cancelled {
+                entry.done = false;
+                entry.error = None;
+                info!("CalculiX job {job_id} cancelled by user");
+            } else if status.success() {
+                entry.done = true;
+                entry.error = None;
                 info!("CalculiX job {job_id} completed successfully");
+            } else {
+                entry.done = true;
+                let message = format!("CalculiX exited with status: {}", status);
+                entry.error = Some(message.clone());
+                error!("CalculiX job {job_id} failed: {status}");
             }
         }
+
         Result::<()>::Ok(())
     }
     .await;
@@ -324,6 +366,7 @@ async fn run_calculix_job(state: AppState, job_id: Uuid) {
             entry.done = true;
             entry.duration = Some(entry.started_instant.elapsed().as_secs_f64());
             entry.error = Some(err.to_string());
+            entry.cancel_token = None;
         }
     }
 }
@@ -343,6 +386,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, 
                 id: entry.id,
                 running: entry.running,
                 done: entry.done,
+                cancelled: entry.cancelled,
                 start_time: entry.started_at,
                 duration_seconds: duration,
                 job_type: entry.job_type.clone(),
@@ -355,6 +399,64 @@ async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, 
     summaries.reverse();
 
     Ok(Json(summaries))
+}
+
+async fn cancel_job(
+    AxumPath(job_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    let cancel_token = {
+        let mut jobs = state.jobs.write().await;
+        let entry = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+        if !entry.running {
+            return Err(AppError::bad_request("Job is not currently running"));
+        }
+
+        entry
+            .cancel_token
+            .clone()
+            .ok_or_else(|| AppError::internal("Cancellation handle missing for job"))?
+    };
+
+    cancel_token.cancel();
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn delete_job(
+    AxumPath(job_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    let job_dir = {
+        let mut jobs = state.jobs.write().await;
+        let entry = jobs
+            .get(&job_id)
+            .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+        if entry.running {
+            return Err(AppError::bad_request(
+                "Cannot delete a job while it is still running",
+            ));
+        }
+
+        let dir = entry.job_dir.clone();
+        jobs.remove(&job_id);
+        dir
+    };
+
+    match fs::remove_dir_all(&job_dir).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::internal(format!(
+                "Failed to delete job directory: {err}"
+            )))
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn download(
@@ -408,3 +510,4 @@ fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
 
     Ok(cursor.into_inner())
 }
+const MAX_UPLOAD_SIZE_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1 GiB

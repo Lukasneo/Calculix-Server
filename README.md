@@ -15,6 +15,15 @@ Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust 
 - CalculiX installed in the container (`calculix-ccx` package on Debian bookworm).
 - Deployment: Docker multi-stage build + `docker compose`.
 
+## Prebuilt Docker Image
+A ready-to-run image is available on Docker Hub for `linux/amd64` hosts:
+
+```bash
+docker pull lukasneo/calculix-server:amd64
+```
+
+Re-tag the image if desired, e.g. `docker tag lukasneo/calculix-server:amd64 calculix-server:latest`.
+
 ## Configuration
 Environment variables (set in `docker-compose.yml` or your orchestration system):
 
@@ -51,9 +60,9 @@ Mount the host directory `./data` into the container to persist results between 
    - Update `CCX_THREADS` to match your CPU.
    - Adjust `UPLOAD_LIMIT_GB` if you expect large uploads.
 
-3. **Build and run**
+3. **Start the stack** (uses `lukasneo/calculix-server:amd64`)
    ```bash
-   docker compose up --build
+   docker compose up -d
    ```
    - The backend listens on `http://localhost:8080`.
    - Job data persists in the `./data` directory.
@@ -70,8 +79,8 @@ Mount the host directory `./data` into the container to persist results between 
 ## Manual Docker Commands
 If you prefer manual control without Compose:
 ```bash
-# Build image
-docker build -t calculix-server .
+# Fetch the prebuilt image
+docker pull lukasneo/calculix-server:amd64
 
 # Run container
 docker run --rm \
@@ -79,7 +88,7 @@ docker run --rm \
   -e CCX_THREADS=8 \
   -e UPLOAD_LIMIT_GB=2 \
   -v "$(pwd)/data:/data" \
-  calculix-server
+  lukasneo/calculix-server:amd64
 ```
 
 ## Offline Image Tarballs
@@ -100,7 +109,7 @@ docker load < calculix-server-amd64.tar
 docker load < calculix-server-arm64.tar
 ```
 
-After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. You can re-tag if desired, e.g. `docker tag calculix-server:amd64 calculix-server:latest`.
+After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. Re-tag if needed, e.g. `docker tag calculix-server:amd64 lukasneo/calculix-server:amd64` or `docker tag calculix-server:amd64 calculix-server:latest`.
 
 ## Development Notes
 - Backend lives in `backend/` (`cargo run` for local debugging).

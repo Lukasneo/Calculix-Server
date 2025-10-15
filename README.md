@@ -109,7 +109,7 @@ docker load < calculix-server-amd64.tar
 docker load < calculix-server-arm64.tar
 ```
 
-After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. Re-tag if needed, e.g. `docker tag calculix-server:amd64 lukasneo/calculix-server:amd64` or `docker tag calculix-server:amd64 calculix-server:latest`.
+After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. You can re-tag if desired, e.g. `docker tag calculix-server:amd64 calculix-server:latest`.
 
 ## Development Notes
 - Backend lives in `backend/` (`cargo run` for local debugging).

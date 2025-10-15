@@ -2,6 +2,17 @@
 
 Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust backend and SvelteKit frontend.
 
+## Table of Contents
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Prebuilt Docker Image](#prebuilt-docker-image)
+- [Configuration](#configuration)
+- [Directory Layout](#directory-layout)
+- [Getting Started](#getting-started)
+- [Manual Docker Commands](#manual-docker-commands)
+- [Development Notes](#development-notes)
+- [License](#license)
+
 ## Features
 - Upload CalculiX `*.inp` models and run them inside isolated job directories (`/data/jobs/<uuid>`).
 - Monitor job list with live durations, status, optional step-type detection, and solver logs.
@@ -49,7 +60,7 @@ Increase `UPLOAD_LIMIT_GB` if you need to accept larger input meshes. Values ≤
 
 Mount the host directory `./data` into the container to persist results between runs.
 
-## Quick Start
+## Getting Started
 1. **Clone the repository**
    ```bash
    git clone https://github.com/<you>/Calculix-Server.git
@@ -90,26 +101,6 @@ docker run --rm \
   -v "$(pwd)/data:/data" \
   lukasneo/calculix-server:amd64
 ```
-
-## Offline Image Tarballs
-Prebuilt images are available in the repository root:
-
-| Architecture | File |
-| --- | --- |
-| `linux/amd64` | `calculix-server-amd64.tar` |
-| `linux/arm64` | `calculix-server-arm64.tar` |
-
-Load the variant that matches your target host:
-
-```bash
-# AMD64 / x86_64 host
-docker load < calculix-server-amd64.tar
-
-# ARM64 / Apple Silicon / Graviton host
-docker load < calculix-server-arm64.tar
-```
-
-After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. You can re-tag if desired, e.g. `docker tag calculix-server:amd64 calculix-server:latest`.
 
 ## Development Notes
 - Backend lives in `backend/` (`cargo run` for local debugging).

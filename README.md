@@ -1,4 +1,4 @@
-# CalculiX Server
+# [CalculiX](https://www.calculix.de) Server
 
 Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust backend and SvelteKit frontend.
 
@@ -81,6 +81,26 @@ docker run --rm \
   -v "$(pwd)/data:/data" \
   calculix-server
 ```
+
+## Offline Image Tarballs
+Prebuilt images are available in the repository root:
+
+| Architecture | File |
+| --- | --- |
+| `linux/amd64` | `calculix-server-amd64.tar` |
+| `linux/arm64` | `calculix-server-arm64.tar` |
+
+Load the variant that matches your target host:
+
+```bash
+# AMD64 / x86_64 host
+docker load < calculix-server-amd64.tar
+
+# ARM64 / Apple Silicon / Graviton host
+docker load < calculix-server-arm64.tar
+```
+
+After loading, the image is tagged as `calculix-server:amd64` or `calculix-server:arm64`. You can re-tag if desired, e.g. `docker tag calculix-server:amd64 calculix-server:latest`.
 
 ## Development Notes
 - Backend lives in `backend/` (`cargo run` for local debugging).

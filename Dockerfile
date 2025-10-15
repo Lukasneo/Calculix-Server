@@ -3,12 +3,15 @@ WORKDIR /app/backend
 COPY backend ./
 RUN cargo build --release --locked
 
+ARG USE_PREBUILT_FRONTEND=0
+
 FROM node:20-bullseye AS frontend-builder
+ARG USE_PREBUILT_FRONTEND
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+RUN if [ "$USE_PREBUILT_FRONTEND" != "1" ]; then npm ci; fi
 COPY frontend ./
-RUN npm run prepare && npm run build
+RUN if [ "$USE_PREBUILT_FRONTEND" != "1" ]; then npm run prepare && npm run build; fi
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app

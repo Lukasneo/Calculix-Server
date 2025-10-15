@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::extract::multipart::Field;
 use axum::extract::DefaultBodyLimit;
 use axum::{
@@ -142,6 +142,12 @@ async fn main() -> Result<()> {
     let frontend_dir =
         PathBuf::from(std::env::var("FRONTEND_DIST").unwrap_or_else(|_| "frontend/build".into()));
 
+    let max_upload_bytes = resolve_upload_limit_bytes()?;
+    info!(
+        "Configured upload limit: {:.2} GiB",
+        max_upload_bytes as f64 / (1024f64 * 1024f64 * 1024f64)
+    );
+
     let state = AppState {
         jobs: Arc::new(RwLock::new(HashMap::new())),
         jobs_dir: Arc::new(jobs_dir.clone()),
@@ -154,7 +160,7 @@ async fn main() -> Result<()> {
         .route("/download/:id", get(download))
         .route("/jobs/:id/cancel", post(cancel_job))
         .route("/jobs/:id", delete(delete_job))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES));
+        .layer(DefaultBodyLimit::max(max_upload_bytes));
 
     let static_service = ServeDir::new(frontend_dir.clone())
         .not_found_service(ServeFile::new(frontend_dir.join("index.html")));
@@ -510,4 +516,24 @@ fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
 
     Ok(cursor.into_inner())
 }
-const MAX_UPLOAD_SIZE_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
+
+fn resolve_upload_limit_bytes() -> Result<usize> {
+    const BYTES_PER_GIB: f64 = 1024f64 * 1024f64 * 1024f64;
+    let raw_value = std::env::var("UPLOAD_LIMIT_GB").unwrap_or_else(|_| "1".to_string());
+    let gigabytes: f64 = raw_value.trim().parse().with_context(|| {
+        format!("Failed to parse UPLOAD_LIMIT_GB value '{raw_value}' as number")
+    })?;
+
+    if gigabytes <= 0.0 {
+        return Err(anyhow!("UPLOAD_LIMIT_GB must be greater than zero"));
+    }
+
+    let bytes = gigabytes * BYTES_PER_GIB;
+    if bytes > usize::MAX as f64 {
+        return Err(anyhow!(
+            "UPLOAD_LIMIT_GB value {gigabytes} GiB exceeds supported size on this platform"
+        ));
+    }
+
+    Ok(bytes as usize)
+}

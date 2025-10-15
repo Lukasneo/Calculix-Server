@@ -290,7 +290,7 @@ async fn run_calculix_job(state: AppState, job_id: Uuid) {
         let mut command = Command::new("ccx");
         command
             .arg("-i")
-            .arg("model.inp")
+            .arg("model")
             .arg("-nt")
             .arg(threads.to_string())
             .current_dir(&job_dir)

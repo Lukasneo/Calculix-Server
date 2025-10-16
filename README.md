@@ -37,7 +37,7 @@ Each job runs inside a secure Docker container with configurable thread and uplo
 - View real-time job status, duration, solver log, and outputs.  
 - Cancel or delete simulations via the web UI.  
 - Download results (`.frd`, `.dat`, logs, etc.) as a ZIP archive.  
-- User accounts with **email/password login** and admin management.  
+- User accounts with **email/password login**, credit balances, and admin management.  
 - Admin dashboard to view, lock, or delete user accounts.  
 - Everything runs in **one container** — no external web server or database needed.  
 
@@ -54,18 +54,29 @@ Each job runs inside a secure Docker container with configurable thread and uplo
 
 ---
 
+## 💳 Credit System
+
+- Every new user starts with **50 credits**; admins can adjust balances or grant *unlimited* credit via the admin panel.  
+- When you upload an `.inp`, the server estimates runtime using a built-in benchmark and reserves the corresponding credits before the solver starts.  
+- Admins and unlimited users never spend credits; their jobs still show the estimated cost for reference.  
+- If CalculiX fails or the job cannot launch, the charged credits are **refunded automatically**.  
+- Estimates come from a benchmark model (`backend/benchmark.inp`). Run `/api/admin/benchmark/run` to update the benchmark score after changing hardware or the file.  
+- You can inspect or adjust balances through the endpoints under `/api/admin/users/{id}/credits` or via the admin UI (“Set credits” prompt accepts numbers or `unlimited`).  
+
+---
+
 ## 🐳 Prebuilt Docker Image
 
 A prebuilt image is available for `linux/amd64` on Docker Hub:
 
 ```bash
-docker pull lukasneo/calculix-server:v1.1
+docker pull lukasneo/calculix-server:v1.2
 ```
 
 You can optionally retag it for convenience:
 
 ```bash
-docker tag lukasneo/calculix-server:v1.1 calculix-server:latest
+docker tag lukasneo/calculix-server:v1.2 calculix-server:latest
 ```
 
 ---
@@ -115,8 +126,8 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
 2. **Create a simple `docker-compose.yml`:**
    ```yaml
    services:
-     calculix-server:
-       image: lukasneo/calculix-server:v1.1
+    calculix-server:
+      image: lukasneo/calculix-server:v1.2
        ports:
          - "8080:8080"
        environment:
@@ -153,7 +164,7 @@ docker run --rm \
   -e CCX_THREADS=8 \
   -e UPLOAD_LIMIT_GB=2 \
   -v "$(pwd)/data:/data" \
-  lukasneo/calculix-server:v1.1
+  lukasneo/calculix-server:v1.2
 ```
 
 ---

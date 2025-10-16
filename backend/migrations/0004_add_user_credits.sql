@@ -1,0 +1,6 @@
+ALTER TABLE users
+ADD COLUMN credits REAL NOT NULL DEFAULT 10000;
+
+UPDATE users
+SET credits = 10000
+WHERE credits IS NULL;

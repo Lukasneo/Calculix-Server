@@ -2,7 +2,13 @@
 	import { goto } from '$app/navigation';
 	import Navbar from '$lib/components/Navbar.svelte';
 	import { apiRequest } from '$lib/api';
-import type { AdminUser, AppSettings, SessionUser } from '$lib/types';
+	import type {
+		AdminUser,
+		AppSettings,
+		BenchmarkStatus,
+		SessionUser,
+		UserCredits
+	} from '$lib/types';
 	import { onMount } from 'svelte';
 
 let user: SessionUser | null = null;
@@ -10,6 +16,9 @@ let users: AdminUser[] = [];
 let loading = true;
 let settings: AppSettings | null = null;
 let settingsBusy = false;
+let benchmark: BenchmarkStatus | null = null;
+let benchmarkLoading = true;
+let benchmarkBusy = false;
 
 	type ToastKind = 'success' | 'error';
 	let toast: { kind: ToastKind; message: string } | null = null;
@@ -58,6 +67,17 @@ let settingsBusy = false;
 		}
 	}
 
+	function formatCredits(value: number) {
+		return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+	}
+
+	function formatBenchmark(value: number | null | undefined) {
+		if (value == null) {
+			return 'Not recorded yet.';
+		}
+		return `${value.toFixed(3)} s`;
+	}
+
 	async function loadData() {
 		const profileResponse = await apiRequest<SessionUser>('profile');
 		if (!profileResponse.ok || !profileResponse.data) {
@@ -71,10 +91,11 @@ let settingsBusy = false;
 			return;
 		}
 
-	await fetchUsers();
-	await fetchSettings();
-	loading = false;
-}
+		await fetchUsers();
+		await fetchSettings();
+		await fetchBenchmark();
+		loading = false;
+	}
 
 async function fetchUsers() {
 	const response = await apiRequest<AdminUser[]>('admin/users');
@@ -98,6 +119,20 @@ async function fetchSettings() {
 	settings = response.data;
 }
 
+async function fetchBenchmark() {
+	benchmarkLoading = true;
+	const response = await apiRequest<BenchmarkStatus>('admin/benchmark');
+	benchmarkLoading = false;
+
+	if (!response.ok || !response.data) {
+		setToast('error', response.error ?? 'Failed to load benchmark status.');
+		benchmark = null;
+		return;
+	}
+
+	benchmark = response.data;
+}
+
 async function toggleSignups() {
 	if (!settings) return;
 	clearToast();
@@ -119,6 +154,82 @@ async function toggleSignups() {
 		settings.allow_signups
 			? 'Sign ups enabled for new users.'
 			: 'Sign ups disabled. New registrations are blocked.'
+	);
+}
+
+	async function adjustCredits(target: AdminUser) {
+		clearToast();
+	const current = target.unlimited ? 'unlimited' : formatCredits(target.credits);
+	const input = prompt(
+		`Set credits for ${target.email} (enter "unlimited" für unbegrenzte Credits)`,
+		current
+	);
+	if (input === null) {
+		return;
+	}
+
+	const trimmed = input.trim().toLowerCase();
+	const unlimited = trimmed === 'unlimited';
+	let parsed = Number(input);
+	if (!unlimited) {
+		if (!Number.isFinite(parsed) || parsed < 0) {
+			setToast('error', 'Enter a non-negative number for credits oder "unlimited".');
+			return;
+		}
+	}
+
+	setRowBusy(target.id, true);
+	const body = unlimited
+		? { unlimited: true }
+		: { credits: parsed, unlimited: false };
+	const response = await apiRequest<UserCredits>(`admin/users/${target.id}/credits`, {
+		method: 'POST',
+		json: body
+	});
+		setRowBusy(target.id, false);
+
+		if (!response.ok || !response.data) {
+			setToast('error', response.error ?? 'Failed to update credits.');
+			return;
+		}
+
+	const payload = response.data;
+
+	users = users.map((item) =>
+		item.id === target.id
+			? { ...item, credits: payload.credits, unlimited: payload.unlimited }
+			: item
+	);
+
+	setToast(
+		'success',
+		payload.unlimited
+			? `Credits für ${target.email} sind jetzt unbegrenzt.`
+			: `Credits for ${target.email} set to ${formatCredits(payload.credits)}.`
+	);
+}
+
+async function runBenchmark() {
+	clearToast();
+	benchmarkBusy = true;
+	const response = await apiRequest<BenchmarkStatus>('admin/benchmark/run', {
+		method: 'POST'
+	});
+	benchmarkBusy = false;
+
+	if (!response.ok || !response.data) {
+		setToast('error', response.error ?? 'Benchmark failed to execute.');
+		return;
+	}
+
+	benchmark = response.data;
+
+	const measured = response.data.score_seconds;
+	setToast(
+		'success',
+		measured != null
+			? `Benchmark completed in ${measured.toFixed(3)} seconds.`
+			: 'Benchmark completed.'
 	);
 }
 
@@ -213,18 +324,48 @@ async function toggleActive(target: AdminUser) {
 		</section>
 
 		<section class="card">
+			<h2>Benchmark</h2>
+			{#if benchmarkLoading}
+				<p>Loading benchmark status…</p>
+			{:else}
+				<p>
+					Latest score:
+					{#if benchmark && benchmark.score_seconds != null}
+						<strong>{formatBenchmark(benchmark.score_seconds)}</strong>
+					{:else}
+						<em>No benchmark run yet.</em>
+					{/if}
+				</p>
+				{#if benchmark && benchmark.recorded_at}
+					<p class="description">
+						Last run {formatDate(benchmark.recorded_at)}
+					</p>
+				{/if}
+				<button
+					class="button primary"
+					type="button"
+					on:click={runBenchmark}
+					disabled={benchmarkBusy}
+				>
+					{benchmarkBusy ? 'Running…' : 'Run Benchmark'}
+				</button>
+			{/if}
+		</section>
+
+		<section class="card">
 			<h2>Accounts</h2>
 			<p>Review all users, toggle access, or remove accounts entirely.</p>
 
-			{#if users.length === 0}
-				<p>No users available.</p>
-			{:else}
-				<table class="users-table">
+					{#if users.length === 0}
+						<p>No users available.</p>
+					{:else}
+						<table class="users-table">
 					<thead>
 						<tr>
 							<th>Email</th>
 							<th>Role</th>
 							<th>Status</th>
+							<th>Credits</th>
 							<th>Created</th>
 							<th>Actions</th>
 						</tr>
@@ -243,12 +384,27 @@ async function toggleActive(target: AdminUser) {
 										{entry.active ? 'Active' : 'Deactivated'}
 									</span>
 								</td>
+								<td>
+									{#if entry.unlimited}
+										<span class="badge">Unlimited</span>
+									{:else}
+										{formatCredits(entry.credits)}
+									{/if}
+								</td>
 								<td>{formatDate(entry.created_at)}</td>
 								<td class="actions-cell">
 									{#if user && user.id === entry.id}
 										<span class="muted">This is your account</span>
 									{:else}
 										<div class="row-actions">
+											<button
+												class="button ghost"
+												type="button"
+												on:click={() => adjustCredits(entry)}
+												disabled={isRowBusy(entry.id)}
+											>
+												{isRowBusy(entry.id) ? 'Updating…' : 'Set credits'}
+											</button>
 											<button
 												class="button ghost"
 												type="button"

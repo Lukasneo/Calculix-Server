@@ -26,7 +26,7 @@
 
 	type ToastKind = 'success' | 'error';
 	let toast: { kind: ToastKind; message: string } | null = null;
-	let toastTimer: ReturnType<typeof setTimeout> | null = null;
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function setToast(kind: ToastKind, message: string) {
 		toast = { kind, message };
@@ -39,12 +39,20 @@
 		}, 4000);
 	}
 
-	function clearToast() {
-		if (toastTimer) {
-			clearTimeout(toastTimer);
-			toastTimer = null;
-		}
-		toast = null;
+function clearToast() {
+	if (toastTimer) {
+		clearTimeout(toastTimer);
+		toastTimer = null;
+	}
+	toast = null;
+}
+
+	function formatCredits(value: number) {
+		return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+	}
+
+	function displayCredits(value: number, unlimited: boolean) {
+		return unlimited ? 'Unlimited' : formatCredits(value);
 	}
 
 	async function loadProfile() {
@@ -169,6 +177,9 @@
 		<p class="description">
 			Email: <strong>{user.email}</strong>
 			<span class="badge">{user.role === 'admin' ? 'Admin' : 'User'}</span>
+		</p>
+		<p class="description">
+			Credits available: <strong>{displayCredits(user.credits, user.unlimited)}</strong>
 		</p>
 
 		<section class="card">

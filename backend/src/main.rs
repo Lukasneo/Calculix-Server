@@ -38,7 +38,7 @@ use time::OffsetDateTime;
 use tokio::{fs, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 use zip::write::FileOptions;
@@ -57,6 +57,7 @@ struct AppState {
 #[derive(Clone)]
 struct JobEntry {
     id: Uuid,
+    owner_id: i64,
     alias: String,
     running: bool,
     done: bool,
@@ -69,11 +70,17 @@ struct JobEntry {
     job_dir: PathBuf,
     error: Option<String>,
     cancel_token: Option<CancellationToken>,
+    element_count: usize,
+    estimated_runtime_seconds: f64,
+    benchmark_score: f64,
+    estimated_credits: f64,
+    charged_credits: f64,
 }
 
 #[derive(Serialize)]
 struct JobSummary {
     id: Uuid,
+    owner_id: i64,
     alias: String,
     running: bool,
     done: bool,
@@ -82,6 +89,11 @@ struct JobSummary {
     duration_seconds: f64,
     job_type: Option<String>,
     error: Option<String>,
+    element_count: usize,
+    estimated_runtime_seconds: f64,
+    benchmark_score: f64,
+    estimated_credits: f64,
+    charged_credits: f64,
 }
 
 #[derive(Serialize)]
@@ -127,6 +139,10 @@ impl AppError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, message)
     }
+
+    fn payment_required(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYMENT_REQUIRED, message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -151,6 +167,14 @@ const PASSWORD_MIN_LEN: usize = 8;
 const MAX_ALIAS_LENGTH: usize = 100;
 const DEFAULT_SIM_STATUS: &str = "pending";
 const SETTING_ALLOW_SIGNUPS: &str = "allow_signups";
+const SETTING_BENCHMARK_SCORE: &str = "benchmark_score";
+const SETTING_BENCHMARK_RECORDED_AT: &str = "benchmark_recorded_at";
+const BENCHMARK_INPUT_PATH: &str = "/app/benchmark.inp";
+const CREDIT_REFERENCE_SCORE: f64 = 0.01;
+const CREDIT_SECONDS_PER_ELEMENT: f64 = 0.02;
+const CREDIT_MIN_ESTIMATED_RUNTIME: f64 = 5.0;
+const DEFAULT_USER_CREDITS: f64 = 50.0;
+const CREDIT_BALANCE_EPSILON: f64 = 1e-6;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -187,6 +211,8 @@ struct UserRecord {
     password_hash: String,
     role: String,
     active: bool,
+    credits: f64,
+    unlimited: bool,
     created_at: i64,
 }
 
@@ -196,6 +222,8 @@ struct UserResponse {
     email: String,
     role: UserRole,
     active: bool,
+    credits: f64,
+    unlimited: bool,
     created_at: String,
 }
 
@@ -205,6 +233,8 @@ struct ProfileResponse {
     email: String,
     role: UserRole,
     active: bool,
+    credits: f64,
+    unlimited: bool,
 }
 
 #[derive(Serialize)]
@@ -213,6 +243,8 @@ struct AdminUserResponse {
     email: String,
     role: UserRole,
     active: bool,
+    credits: f64,
+    unlimited: bool,
     created_at: String,
 }
 
@@ -221,9 +253,147 @@ struct SettingsResponse {
     allow_signups: bool,
 }
 
+#[derive(Serialize)]
+struct BenchmarkResponse {
+    score_seconds: Option<f64>,
+    recorded_at: Option<String>,
+}
+
+struct JobCreditEstimate {
+    estimated_credits: f64,
+    estimated_runtime_seconds: f64,
+    element_count: usize,
+    benchmark_score: f64,
+}
+
+struct CreditEstimator {
+    reference_score: f64,
+    seconds_per_element: f64,
+    min_runtime_seconds: f64,
+}
+
+impl CreditEstimator {
+    fn new(reference_score: f64, seconds_per_element: f64, min_runtime_seconds: f64) -> Self {
+        Self {
+            reference_score,
+            seconds_per_element,
+            min_runtime_seconds,
+        }
+    }
+
+    fn calculate(&self, estimated_runtime_seconds: f64, benchmark_score: f64) -> f64 {
+        let benchmark = if benchmark_score > 0.0 {
+            benchmark_score
+        } else {
+            self.reference_score
+        };
+
+        (estimated_runtime_seconds * self.reference_score) / benchmark
+    }
+
+    fn estimate_runtime_from_elements(&self, element_count: usize) -> f64 {
+        let computed = element_count as f64 * self.seconds_per_element;
+        let sanitized = if computed.is_finite() { computed } else { 0.0 };
+        sanitized.max(self.min_runtime_seconds)
+    }
+
+    async fn estimate_from_contents(
+        &self,
+        pool: &SqlitePool,
+        contents: &str,
+    ) -> Result<JobCreditEstimate, AppError> {
+        let mut element_count = count_elements_in_inp(contents);
+        if element_count == 0 {
+            element_count = count_nodes_in_inp(contents);
+        }
+
+        let benchmark_score = load_benchmark_score(pool, self.reference_score).await?;
+        let estimated_runtime_seconds = self.estimate_runtime_from_elements(element_count);
+        let estimated_credits = self.calculate(estimated_runtime_seconds, benchmark_score);
+
+        Ok(JobCreditEstimate {
+            estimated_credits,
+            estimated_runtime_seconds,
+            element_count,
+            benchmark_score,
+        })
+    }
+
+    async fn estimate_from_input_file(
+        &self,
+        pool: &SqlitePool,
+        path: &Path,
+    ) -> Result<JobCreditEstimate, AppError> {
+        let contents = fs::read_to_string(path)
+            .await
+            .map_err(|err| AppError::internal(format!("Failed to read job input file: {err}")))?;
+
+        self.estimate_from_contents(pool, &contents).await
+    }
+
+    async fn estimate_job_cost(
+        &self,
+        state: &AppState,
+        job_id: Uuid,
+    ) -> Result<JobCreditEstimate, AppError> {
+        let job = {
+            let jobs = state.jobs.read().await;
+            jobs.get(&job_id).cloned()
+        }
+        .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+        let model_path = job.job_dir.join("model.inp");
+        self.estimate_from_input_file(&state.db_pool, &model_path)
+            .await
+    }
+}
+
+impl Default for CreditEstimator {
+    fn default() -> Self {
+        CreditEstimator::new(
+            CREDIT_REFERENCE_SCORE,
+            CREDIT_SECONDS_PER_ELEMENT,
+            CREDIT_MIN_ESTIMATED_RUNTIME,
+        )
+    }
+}
+#[derive(Serialize)]
+struct JobEstimateResponse {
+    job_id: Uuid,
+    estimated_credits: f64,
+    estimated_runtime_seconds: f64,
+    element_count: usize,
+    benchmark_score: f64,
+    charged_credits: f64,
+}
+
+#[derive(Serialize)]
+struct UserCreditsResponse {
+    id: i64,
+    email: String,
+    credits: f64,
+    unlimited: bool,
+}
+
+#[derive(Serialize)]
+struct JobEstimatePreviewResponse {
+    estimated_credits: f64,
+    estimated_runtime_seconds: f64,
+    element_count: usize,
+    benchmark_score: f64,
+    charged_credits: f64,
+}
+
 #[derive(Deserialize)]
 struct UpdateSettingsPayload {
     allow_signups: bool,
+}
+
+#[derive(Deserialize)]
+struct AdjustCreditsPayload {
+    credits: Option<f64>,
+    delta: Option<f64>,
+    unlimited: Option<bool>,
 }
 
 impl UserRecord {
@@ -234,6 +404,8 @@ impl UserRecord {
             email: self.email,
             role,
             active: self.active,
+            credits: self.credits,
+            unlimited: self.unlimited,
             created_at: format_timestamp(self.created_at)?,
         })
     }
@@ -245,6 +417,8 @@ impl UserRecord {
             email: self.email,
             role,
             active: self.active,
+            credits: self.credits,
+            unlimited: self.unlimited,
         })
     }
 
@@ -255,6 +429,8 @@ impl UserRecord {
             email: self.email,
             role,
             active: self.active,
+            credits: self.credits,
+            unlimited: self.unlimited,
             created_at: format_timestamp(self.created_at)?,
         })
     }
@@ -337,11 +513,16 @@ struct AuthClaims {
 struct AuthUser {
     user_id: i64,
     role: UserRole,
+    unlimited: bool,
 }
 
 impl AuthUser {
     fn is_admin(&self) -> bool {
         self.role.is_admin()
+    }
+
+    fn has_unlimited_credits(&self) -> bool {
+        self.unlimited
     }
 }
 
@@ -465,6 +646,7 @@ where
         Ok(AuthUser {
             user_id: user_record.id,
             role,
+            unlimited: user_record.unlimited,
         })
     }
 }
@@ -474,7 +656,7 @@ async fn fetch_user_by_email(
     email: &str,
 ) -> Result<Option<UserRecord>, AppError> {
     query_as::<_, UserRecord>(
-        "SELECT id, email, password_hash, role, active, created_at FROM users WHERE email = ?",
+        "SELECT id, email, password_hash, role, active, credits, unlimited, created_at FROM users WHERE email = ?",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -484,7 +666,7 @@ async fn fetch_user_by_email(
 
 async fn fetch_user_by_id(pool: &SqlitePool, user_id: i64) -> Result<UserRecord, AppError> {
     query_as::<_, UserRecord>(
-        "SELECT id, email, password_hash, role, active, created_at FROM users WHERE id = ?",
+        "SELECT id, email, password_hash, role, active, credits, unlimited, created_at FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -526,12 +708,16 @@ async fn ensure_default_admin(pool: &SqlitePool, email: &str, password: &str) ->
         .map_err(|err| anyhow!("Failed to hash default admin password: {err}"))?
         .to_string();
 
-    query("INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)")
-        .bind(&normalized_email)
-        .bind(password_hash)
-        .bind(ROLE_ADMIN)
-        .execute(pool)
-        .await?;
+    query(
+        "INSERT INTO users (email, password_hash, role, credits, unlimited) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&normalized_email)
+    .bind(password_hash)
+    .bind(ROLE_ADMIN)
+    .bind(DEFAULT_USER_CREDITS)
+    .bind(0)
+    .execute(pool)
+    .await?;
 
     info!(
         "Created default admin account {normalized_email}. Please change the password immediately."
@@ -617,6 +803,151 @@ async fn get_bool_setting(pool: &SqlitePool, key: &str, default: bool) -> Result
 
 async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
     ensure_setting(pool, SETTING_ALLOW_SIGNUPS, "true").await
+}
+
+async fn set_string_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), AppError> {
+    query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to persist setting {key}: {err}")))?;
+    Ok(())
+}
+
+async fn get_string_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, AppError> {
+    let result = query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to fetch setting {key}: {err}")))?;
+
+    Ok(result.map(|(value,)| value))
+}
+
+fn count_elements_in_inp(source: &str) -> usize {
+    parse_inp_block_entries(source, "*ELEMENT")
+}
+
+fn count_nodes_in_inp(source: &str) -> usize {
+    parse_inp_block_entries(source, "*NODE")
+}
+
+fn parse_inp_block_entries(source: &str, block_header: &str) -> usize {
+    let mut in_block = false;
+    let mut count = 0usize;
+    let target = block_header.to_ascii_uppercase();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("**") {
+            continue;
+        }
+
+        if trimmed.starts_with('*') {
+            let upper = trimmed.to_ascii_uppercase();
+            in_block = upper.starts_with(&target);
+            continue;
+        }
+
+        if in_block {
+            count = count.saturating_add(1);
+        }
+    }
+
+    count
+}
+
+async fn load_benchmark_score(pool: &SqlitePool, fallback: f64) -> Result<f64, AppError> {
+    match get_string_setting(pool, SETTING_BENCHMARK_SCORE).await? {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => Ok(value),
+                Ok(_) => {
+                    error!("Stored benchmark score is non-positive or invalid: {trimmed}");
+                    Ok(fallback)
+                }
+                Err(err) => {
+                    error!("Failed to parse stored benchmark score ({trimmed}): {err}");
+                    Ok(fallback)
+                }
+            }
+        }
+        None => Ok(fallback),
+    }
+}
+
+async fn debit_user_credits(pool: &SqlitePool, user_id: i64, amount: f64) -> Result<f64, AppError> {
+    let record = query_as::<_, (f64, bool)>("SELECT credits, unlimited FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to read user credits: {err}")))?;
+
+    let (current_credits, unlimited) = match record {
+        Some(record) => record,
+        None => return Err(AppError::not_found("User not found")),
+    };
+
+    if unlimited || !amount.is_finite() || amount <= CREDIT_BALANCE_EPSILON {
+        return Ok(current_credits);
+    }
+
+    let updated = query_as::<_, (f64,)>(
+        "UPDATE users SET credits = credits - ? WHERE id = ? AND unlimited = 0 AND credits >= ? RETURNING credits",
+    )
+    .bind(amount)
+    .bind(user_id)
+    .bind(amount)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| AppError::internal(format!("Failed to debit credits: {err}")))?;
+
+    if let Some((balance,)) = updated {
+        return Ok(balance.max(0.0));
+    }
+
+    if current_credits + CREDIT_BALANCE_EPSILON < amount {
+        Err(AppError::payment_required(
+            "Not enough credits to start simulation",
+        ))
+    } else {
+        Err(AppError::internal(
+            "Failed to debit credits despite sufficient balance",
+        ))
+    }
+}
+
+async fn credit_user_credits(
+    pool: &SqlitePool,
+    user_id: i64,
+    amount: f64,
+) -> Result<f64, AppError> {
+    if !amount.is_finite() || amount <= CREDIT_BALANCE_EPSILON {
+        let record = query_as::<_, (f64,)>("SELECT credits FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| AppError::internal(format!("Failed to read user credits: {err}")))?;
+
+        return record
+            .map(|(value,)| value)
+            .ok_or_else(|| AppError::not_found("User not found"));
+    }
+
+    let updated = query_as::<_, (f64,)>(
+        "UPDATE users SET credits = credits + ? WHERE id = ? RETURNING credits",
+    )
+    .bind(amount)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| AppError::internal(format!("Failed to credit user: {err}")))?;
+
+    updated
+        .map(|(balance,)| balance)
+        .ok_or_else(|| AppError::not_found("User not found"))
 }
 
 fn core_api_router() -> Router<AppState> {
@@ -737,8 +1068,10 @@ async fn main() -> Result<()> {
         .route("/status", get(status))
         .route("/download/:id", get(download))
         .route("/jobs/:id/cancel", post(cancel_job))
+        .route("/jobs/estimate", post(estimate_job_upload_preview))
         .route("/jobs/:id", delete(delete_job))
-        .layer(DefaultBodyLimit::max(max_upload_bytes));
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
+        .route_layer(from_fn_with_state(state.clone(), require_auth));
 
     let profile_router = Router::new()
         .route("/", get(profile))
@@ -750,6 +1083,12 @@ async fn main() -> Result<()> {
         .route("/users", get(admin_list_users))
         .route("/users/:id/toggle_active", post(admin_toggle_user_active))
         .route("/users/:id", delete(admin_delete_user))
+        .route(
+            "/users/:id/credits",
+            get(admin_get_user_credits).post(admin_update_user_credits),
+        )
+        .route("/benchmark", get(admin_get_benchmark))
+        .route("/benchmark/run", post(admin_run_benchmark))
         .nest(
             "/settings",
             Router::new().route("/", get(admin_get_settings).post(admin_update_settings)),
@@ -761,7 +1100,12 @@ async fn main() -> Result<()> {
     let api_router = core_api_router()
         .nest("/profile", profile_router)
         .nest("/admin", admin_router)
-        .nest("/settings", public_settings_router);
+        .nest("/settings", public_settings_router)
+        .merge(
+            Router::new()
+                .route("/jobs/:id/estimate", get(estimate_job_credits))
+                .route_layer(from_fn_with_state(state.clone(), require_auth)),
+        );
 
     let legacy_router = core_api_router();
 
@@ -834,13 +1178,17 @@ async fn register(
         .map_err(|err| AppError::internal(format!("Failed to hash password: {err}")))?
         .to_string();
 
-    let result = query("INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)")
-        .bind(&email)
-        .bind(&password_hash)
-        .bind(target_role.as_str())
-        .execute(&state.db_pool)
-        .await
-        .map_err(|err| AppError::internal(format!("Failed to create user: {err}")))?;
+    let result = query(
+        "INSERT INTO users (email, password_hash, role, credits, unlimited) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .bind(target_role.as_str())
+    .bind(DEFAULT_USER_CREDITS)
+    .bind(0)
+    .execute(&state.db_pool)
+    .await
+    .map_err(|err| AppError::internal(format!("Failed to create user: {err}")))?;
 
     let user_id = result.last_insert_rowid();
     let user_record = fetch_user_by_id(&state.db_pool, user_id).await?;
@@ -993,7 +1341,7 @@ async fn admin_list_users(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AdminUserResponse>>, AppError> {
     let users = query_as::<_, UserRecord>(
-        "SELECT id, email, password_hash, role, active, created_at FROM users ORDER BY created_at DESC",
+        "SELECT id, email, password_hash, role, active, credits, unlimited, created_at FROM users ORDER BY created_at DESC",
     )
     .fetch_all(&state.db_pool)
     .await
@@ -1030,6 +1378,218 @@ async fn admin_update_settings(
 ) -> Result<Json<SettingsResponse>, AppError> {
     set_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, payload.allow_signups).await?;
     Ok(Json(load_settings(&state.db_pool).await?))
+}
+
+async fn admin_get_user_credits(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<i64>,
+) -> Result<Json<UserCreditsResponse>, AppError> {
+    let record = match fetch_user_by_id(&state.db_pool, user_id).await {
+        Ok(record) => record,
+        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
+            return Err(AppError::not_found("User not found"));
+        }
+        Err(err) => return Err(err),
+    };
+
+    Ok(Json(UserCreditsResponse {
+        id: record.id,
+        email: record.email,
+        credits: record.credits,
+        unlimited: record.unlimited,
+    }))
+}
+
+async fn admin_update_user_credits(
+    State(state): State<AppState>,
+    AxumPath(user_id): AxumPath<i64>,
+    Json(payload): Json<AdjustCreditsPayload>,
+) -> Result<Json<UserCreditsResponse>, AppError> {
+    let mut record = match fetch_user_by_id(&state.db_pool, user_id).await {
+        Ok(record) => record,
+        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
+            return Err(AppError::not_found("User not found"));
+        }
+        Err(err) => return Err(err),
+    };
+
+    if payload.credits.is_some() && payload.delta.is_some() {
+        return Err(AppError::bad_request(
+            "Provide either 'credits' or 'delta', not both",
+        ));
+    }
+
+    let target_unlimited = payload.unlimited.unwrap_or(record.unlimited);
+
+    let mut target_credits = record.credits;
+
+    if target_unlimited {
+        // Unlimited users keep their current balance (for reference only).
+        target_credits = record.credits;
+    } else {
+        if let Some(value) = payload.credits {
+            target_credits = value;
+        } else if let Some(delta) = payload.delta {
+            target_credits = record.credits + delta;
+        } else if record.unlimited && payload.unlimited == Some(false) {
+            // Switching off unlimited without specifying a target amount.
+            target_credits = DEFAULT_USER_CREDITS;
+        }
+
+        if !target_credits.is_finite() || target_credits < 0.0 {
+            return Err(AppError::bad_request(
+                "Credits must be a non-negative finite number",
+            ));
+        }
+    }
+
+    query("UPDATE users SET credits = ?, unlimited = ? WHERE id = ?")
+        .bind(target_credits)
+        .bind(if target_unlimited { 1 } else { 0 })
+        .bind(user_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to update credits: {err}")))?;
+
+    record.credits = target_credits;
+    record.unlimited = target_unlimited;
+
+    Ok(Json(UserCreditsResponse {
+        id: record.id,
+        email: record.email,
+        credits: record.credits,
+        unlimited: record.unlimited,
+    }))
+}
+
+async fn admin_get_benchmark(
+    State(state): State<AppState>,
+) -> Result<Json<BenchmarkResponse>, AppError> {
+    let raw_score = get_string_setting(&state.db_pool, SETTING_BENCHMARK_SCORE).await?;
+    let raw_recorded_at = get_string_setting(&state.db_pool, SETTING_BENCHMARK_RECORDED_AT).await?;
+
+    let score_seconds = raw_score.as_deref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            match trimmed.parse::<f64>() {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    error!("Stored benchmark score is invalid ({trimmed}): {err}");
+                    None
+                }
+            }
+        }
+    });
+
+    let recorded_at = raw_recorded_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    Ok(Json(BenchmarkResponse {
+        score_seconds,
+        recorded_at,
+    }))
+}
+
+async fn admin_run_benchmark(
+    State(state): State<AppState>,
+) -> Result<Json<BenchmarkResponse>, AppError> {
+    let benchmark_path = {
+        let candidates = [
+            PathBuf::from(BENCHMARK_INPUT_PATH),
+            PathBuf::from("benchmark.inp"),
+            PathBuf::from("backend/benchmark.inp"),
+        ];
+
+        candidates
+            .into_iter()
+            .find(|path| path.exists())
+            .ok_or_else(|| {
+                AppError::internal(format!(
+                    "Benchmark input file not found (expected at {BENCHMARK_INPUT_PATH})"
+                ))
+            })?
+    };
+
+    let run_id = Uuid::new_v4();
+    let run_dir = state.jobs_dir.join(format!("benchmark-{run_id}"));
+    fs::create_dir_all(&run_dir).await.map_err(|err| {
+        AppError::internal(format!("Failed to create benchmark directory: {err}"))
+    })?;
+
+    let model_path = run_dir.join("model.inp");
+    fs::copy(&benchmark_path, &model_path)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to prepare benchmark input: {err}")))?;
+
+    let log_path = run_dir.join("solver.log");
+
+    let outcome: Result<f64, AppError> = async {
+        let log_file = std::fs::File::create(&log_path)
+            .map_err(|err| AppError::internal(format!("Failed to create benchmark log: {err}")))?;
+        let log_file_err = log_file.try_clone().map_err(|err| {
+            AppError::internal(format!("Failed to initialise benchmark log: {err}"))
+        })?;
+
+        let mut command = Command::new("ccx");
+        command
+            .arg("-i")
+            .arg("model")
+            .arg("-nt")
+            .arg(state.ccx_threads.to_string())
+            .current_dir(&run_dir)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err));
+
+        info!("Starting benchmark run {run_id}");
+
+        let start = Instant::now();
+        let mut child = command
+            .spawn()
+            .map_err(|err| AppError::internal(format!("Failed to start benchmark: {err}")))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| AppError::internal(format!("Failed to await benchmark: {err}")))?;
+
+        if !status.success() {
+            return Err(AppError::internal(format!(
+                "Benchmark failed with status: {status}"
+            )));
+        }
+
+        Ok(start.elapsed().as_secs_f64())
+    }
+    .await;
+
+    if let Err(err) = fs::remove_dir_all(&run_dir).await {
+        error!(
+            "Failed to clean up benchmark directory {}: {err}",
+            run_dir.display()
+        );
+    }
+
+    let elapsed = outcome?;
+    let recorded_at = Utc::now().to_rfc3339();
+
+    set_string_setting(
+        &state.db_pool,
+        SETTING_BENCHMARK_SCORE,
+        &format!("{elapsed:.6}"),
+    )
+    .await?;
+    set_string_setting(&state.db_pool, SETTING_BENCHMARK_RECORDED_AT, &recorded_at).await?;
+
+    info!("Benchmark run {run_id} completed in {elapsed:.3} seconds (recorded at {recorded_at})");
+
+    Ok(Json(BenchmarkResponse {
+        score_seconds: Some(elapsed),
+        recorded_at: Some(recorded_at),
+    }))
 }
 
 async fn admin_toggle_user_active(
@@ -1219,6 +1779,7 @@ async fn update_simulation(
 
 async fn upload(
     State(state): State<AppState>,
+    auth: AuthUser,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
     let mut alias: Option<String> = None;
@@ -1255,7 +1816,7 @@ async fn upload(
                     .clone()
                     .ok_or_else(|| AppError::bad_request("Alias is required before uploading"))?;
 
-                return process_inp_upload(file_field, state, alias).await;
+                return process_inp_upload(file_field, state, auth.clone(), alias).await;
             }
             Some(_) => {
                 // Ignore unknown fields.
@@ -1271,6 +1832,7 @@ async fn upload(
 async fn process_inp_upload(
     mut field: Field<'_>,
     state: AppState,
+    auth: AuthUser,
     alias: String,
 ) -> Result<Json<UploadResponse>, AppError> {
     let job_id = Uuid::new_v4();
@@ -1298,12 +1860,75 @@ async fn process_inp_upload(
         .await
         .map_err(|err| AppError::internal(format!("Failed to flush model.inp: {err}")))?;
 
+    let estimator = CreditEstimator::default();
+    let estimate = match estimator
+        .estimate_from_input_file(&state.db_pool, &model_path)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if let Err(clean_err) = fs::remove_dir_all(&job_dir).await {
+                if clean_err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to clean up job directory {} after estimate failure: {clean_err}",
+                        job_dir.display()
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    let estimated_credits = if estimate.estimated_credits.is_finite() {
+        estimate.estimated_credits.max(0.0)
+    } else {
+        0.0
+    };
+
+    let has_free_credits = auth.is_admin() || auth.has_unlimited_credits();
+    let charged_credits = if has_free_credits {
+        0.0
+    } else {
+        estimated_credits
+    };
+
+    if charged_credits > CREDIT_BALANCE_EPSILON {
+        match debit_user_credits(&state.db_pool, auth.user_id, charged_credits).await {
+            Ok(balance) => info!(
+                "User {} charged {:.3} credits for job {} (remaining {:.3})",
+                auth.user_id, charged_credits, job_id, balance
+            ),
+            Err(err) => {
+                if let Err(clean_err) = fs::remove_dir_all(&job_dir).await {
+                    if clean_err.kind() != std::io::ErrorKind::NotFound {
+                        warn!(
+                            "Failed to clean up job directory {} after credit failure: {clean_err}",
+                            job_dir.display()
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
+    } else if auth.is_admin() {
+        info!(
+            "Admin user {} started job {} without credit deduction (estimate {:.3} credits)",
+            auth.user_id, job_id, estimated_credits
+        );
+    } else if auth.has_unlimited_credits() {
+        info!(
+            "User {} has unlimited credits; job {} not charged (estimate {:.3} credits)",
+            auth.user_id, job_id, estimated_credits
+        );
+    }
+
     let detected_job_type = detect_job_type(&model_path).await.unwrap_or(None);
 
     let cancel_token = CancellationToken::new();
 
     let job_entry = JobEntry {
         id: job_id,
+        owner_id: auth.user_id,
         alias: alias.clone(),
         running: true,
         done: false,
@@ -1316,6 +1941,11 @@ async fn process_inp_upload(
         job_dir: job_dir.clone(),
         error: None,
         cancel_token: Some(cancel_token.clone()),
+        element_count: estimate.element_count,
+        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
+        benchmark_score: estimate.benchmark_score,
+        estimated_credits,
+        charged_credits,
     };
 
     {
@@ -1401,6 +2031,7 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
         };
 
         let mut jobs = state.jobs.write().await;
+        let mut refund: Option<(i64, f64)> = None;
         if let Some(entry) = jobs.get_mut(&job_id) {
             entry.running = false;
             entry.cancel_token = None;
@@ -1420,30 +2051,75 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
                 let message = format!("CalculiX exited with status: {}", status);
                 entry.error = Some(message.clone());
                 error!("CalculiX job {job_id} failed: {status}");
+                if entry.charged_credits > CREDIT_BALANCE_EPSILON {
+                    refund = Some((entry.owner_id, entry.charged_credits));
+                    entry.charged_credits = 0.0;
+                }
             }
         }
 
-        Result::<()>::Ok(())
+        Result::<Option<(i64, f64)>>::Ok(refund)
     }
     .await;
 
-    if let Err(err) = result {
-        error!("CalculiX job {job_id} failed to run: {err:?}");
-        let mut jobs = state.jobs.write().await;
-        if let Some(entry) = jobs.get_mut(&job_id) {
-            entry.running = false;
-            entry.done = true;
-            entry.duration = Some(entry.started_instant.elapsed().as_secs_f64());
-            entry.error = Some(err.to_string());
-            entry.cancel_token = None;
+    match result {
+        Ok(Some((user_id, amount))) => {
+            if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await {
+                warn!(
+                    "Failed to refund credits for job {} (user {}): {:?}",
+                    job_id, user_id, refund_err
+                );
+            } else {
+                info!(
+                    "Refunded {:.3} credits to user {} after job {} failure",
+                    amount, user_id, job_id
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            error!("CalculiX job {job_id} failed to run: {err:?}");
+            let mut jobs = state.jobs.write().await;
+            let mut refund: Option<(i64, f64)> = None;
+            if let Some(entry) = jobs.get_mut(&job_id) {
+                entry.running = false;
+                entry.done = true;
+                entry.duration = Some(entry.started_instant.elapsed().as_secs_f64());
+                entry.error = Some(err.to_string());
+                entry.cancel_token = None;
+                if entry.charged_credits > CREDIT_BALANCE_EPSILON {
+                    refund = Some((entry.owner_id, entry.charged_credits));
+                    entry.charged_credits = 0.0;
+                }
+            }
+            drop(jobs);
+
+            if let Some((user_id, amount)) = refund {
+                if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await
+                {
+                    warn!(
+                        "Failed to refund credits for job {} (user {}): {:?}",
+                        job_id, user_id, refund_err
+                    );
+                } else {
+                    info!(
+                        "Refunded {:.3} credits to user {} after job {} execution failure",
+                        amount, user_id, job_id
+                    );
+                }
+            }
         }
     }
 }
 
-async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, AppError> {
+async fn status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<JobSummary>>, AppError> {
     let jobs = state.jobs.read().await;
     let mut summaries: Vec<JobSummary> = jobs
         .values()
+        .filter(|entry| auth.is_admin() || entry.owner_id == auth.user_id)
         .map(|entry| {
             let duration = if entry.running {
                 entry.started_instant.elapsed().as_secs_f64()
@@ -1453,6 +2129,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, 
 
             JobSummary {
                 id: entry.id,
+                owner_id: entry.owner_id,
                 alias: entry.alias.clone(),
                 running: entry.running,
                 done: entry.done,
@@ -1461,6 +2138,11 @@ async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, 
                 duration_seconds: duration,
                 job_type: entry.job_type.clone(),
                 error: entry.error.clone(),
+                element_count: entry.element_count,
+                estimated_runtime_seconds: entry.estimated_runtime_seconds,
+                benchmark_score: entry.benchmark_score,
+                estimated_credits: entry.estimated_credits,
+                charged_credits: entry.charged_credits,
             }
         })
         .collect();
@@ -1471,15 +2153,141 @@ async fn status(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>>, 
     Ok(Json(summaries))
 }
 
+async fn estimate_job_credits(
+    AxumPath(job_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<JobEstimateResponse>, AppError> {
+    let job_entry = {
+        let jobs = state.jobs.read().await;
+        jobs.get(&job_id).cloned()
+    }
+    .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+    if !auth.is_admin() && job_entry.owner_id != auth.user_id {
+        return Err(AppError::forbidden(
+            "You are not allowed to inspect this job",
+        ));
+    }
+
+    let mut estimate = JobCreditEstimate {
+        estimated_credits: job_entry.estimated_credits,
+        estimated_runtime_seconds: job_entry.estimated_runtime_seconds,
+        element_count: job_entry.element_count,
+        benchmark_score: job_entry.benchmark_score,
+    };
+
+    if estimate.element_count == 0 || !estimate.estimated_credits.is_finite() {
+        let estimator = CreditEstimator::default();
+        estimate = estimator.estimate_job_cost(&state, job_id).await?;
+    }
+
+    let charged_credits = if auth.is_admin() || auth.has_unlimited_credits() {
+        0.0
+    } else if estimate.estimated_credits.is_finite() {
+        estimate.estimated_credits.max(0.0)
+    } else {
+        0.0
+    };
+
+    Ok(Json(JobEstimateResponse {
+        job_id,
+        estimated_credits: estimate.estimated_credits,
+        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
+        element_count: estimate.element_count,
+        benchmark_score: estimate.benchmark_score,
+        charged_credits,
+    }))
+}
+
+async fn estimate_job_upload_preview(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    mut multipart: Multipart,
+) -> Result<Json<JobEstimatePreviewResponse>, AppError> {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut received_file = false;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?
+    {
+        let name = field.name().map(|name| name.to_string());
+        match name.as_deref() {
+            Some("alias") => {
+                // Alias is optional for estimation; ignore value.
+                let _ = field.text().await;
+            }
+            Some("file") | None => {
+                received_file = true;
+                while let Some(chunk) = field.chunk().await.map_err(|err| {
+                    AppError::internal(format!("Failed to read upload chunk: {err}"))
+                })? {
+                    buffer.extend_from_slice(&chunk);
+                }
+            }
+            Some(_) => {
+                // Ignore any other fields.
+            }
+        }
+    }
+
+    if !received_file {
+        return Err(AppError::bad_request(
+            "Request must include a CalculiX .inp file for estimation",
+        ));
+    }
+
+    if buffer.is_empty() {
+        return Err(AppError::bad_request("Uploaded file is empty"));
+    }
+
+    let contents = String::from_utf8(buffer)
+        .map_err(|_| AppError::bad_request("Input file must be UTF-8 encoded text"))?;
+
+    let estimator = CreditEstimator::default();
+    let estimate = estimator
+        .estimate_from_contents(&state.db_pool, &contents)
+        .await?;
+
+    let estimated_credits = if estimate.estimated_credits.is_finite() {
+        estimate.estimated_credits.max(0.0)
+    } else {
+        0.0
+    };
+
+    let charged_credits = if auth.is_admin() || auth.has_unlimited_credits() {
+        0.0
+    } else {
+        estimated_credits
+    };
+
+    Ok(Json(JobEstimatePreviewResponse {
+        estimated_credits,
+        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
+        element_count: estimate.element_count,
+        benchmark_score: estimate.benchmark_score,
+        charged_credits,
+    }))
+}
+
 async fn cancel_job(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    auth: AuthUser,
 ) -> Result<StatusCode, AppError> {
     let cancel_token = {
         let mut jobs = state.jobs.write().await;
         let entry = jobs
             .get_mut(&job_id)
             .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+        if !auth.is_admin() && entry.owner_id != auth.user_id {
+            return Err(AppError::forbidden(
+                "You are not allowed to cancel this job",
+            ));
+        }
 
         if !entry.running {
             return Err(AppError::bad_request("Job is not currently running"));
@@ -1498,12 +2306,19 @@ async fn cancel_job(
 async fn delete_job(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    auth: AuthUser,
 ) -> Result<StatusCode, AppError> {
     let job_dir = {
         let mut jobs = state.jobs.write().await;
         let entry = jobs
             .get(&job_id)
             .ok_or_else(|| AppError::not_found("Job not found"))?;
+
+        if !auth.is_admin() && entry.owner_id != auth.user_id {
+            return Err(AppError::forbidden(
+                "You are not allowed to delete this job",
+            ));
+        }
 
         if entry.running {
             return Err(AppError::bad_request(
@@ -1532,6 +2347,7 @@ async fn delete_job(
 async fn download(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    auth: AuthUser,
 ) -> Result<Response, AppError> {
     let job = {
         let jobs = state.jobs.read().await;
@@ -1539,6 +2355,12 @@ async fn download(
     };
 
     let job = job.ok_or_else(|| AppError::not_found("Job not found"))?;
+
+    if !auth.is_admin() && job.owner_id != auth.user_id {
+        return Err(AppError::forbidden(
+            "You are not allowed to download this job",
+        ));
+    }
 
     let zip_bytes = tokio::task::spawn_blocking(move || create_results_archive(&job.job_dir))
         .await
@@ -1644,15 +2466,18 @@ mod tests {
             .expect("failed to hash password")
             .to_string();
 
-        let result =
-            query("INSERT INTO users (email, password_hash, role, active) VALUES (?, ?, ?, ?)")
-                .bind(email)
-                .bind(password_hash)
-                .bind(role.as_str())
-                .bind(active)
-                .execute(&state.db_pool)
-                .await
-                .expect("failed to insert user");
+        let result = query(
+            "INSERT INTO users (email, password_hash, role, active, credits, unlimited) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(role.as_str())
+        .bind(active)
+        .bind(DEFAULT_USER_CREDITS)
+        .bind(0)
+        .execute(&state.db_pool)
+        .await
+        .expect("failed to insert user");
 
         result.last_insert_rowid()
     }

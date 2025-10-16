@@ -36,6 +36,7 @@ RUN apt-get update \
 # Copy binaries
 COPY --from=backend-builder /app/backend/target/release/calculix_server /usr/local/bin/server
 COPY --from=frontend-builder /app/frontend/build /app/frontend
+COPY backend/benchmark.inp /app/benchmark.inp
 
 # Environment variables
 ENV APP_ADDR=0.0.0.0:8080 \

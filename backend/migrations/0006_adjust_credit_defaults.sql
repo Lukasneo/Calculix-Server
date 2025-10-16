@@ -1,0 +1,6 @@
+ALTER TABLE users
+ADD COLUMN unlimited INTEGER NOT NULL DEFAULT 0;
+
+UPDATE users
+SET credits = 50
+WHERE credits = 10000;

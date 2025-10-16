@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import Navbar from '$lib/components/Navbar.svelte';
 	import { apiRequest } from '$lib/api';
-	import type { SessionUser } from '$lib/types';
+	import type { JobEstimatePreview, SessionUser } from '$lib/types';
 	import { onDestroy, onMount } from 'svelte';
 
 	type Job = {
@@ -13,6 +13,11 @@
 		cancelled: boolean;
 		start_time: string;
 		duration_seconds: number;
+		element_count: number;
+		estimated_runtime_seconds: number;
+		benchmark_score: number;
+		estimated_credits: number;
+		charged_credits: number;
 		job_type?: string | null;
 		error?: string | null;
 	};
@@ -34,6 +39,10 @@
 	let fileInput: HTMLInputElement | null = null;
 	let successMessage = '';
 	let errorMessage = '';
+	let estimate: JobEstimatePreview | null = null;
+	let estimateBusy = false;
+	let estimateError: string | null = null;
+	let estimateRequestId = 0;
 
 	function resetMessages() {
 		successMessage = '';
@@ -51,6 +60,19 @@
 	function formatDuration(seconds?: number | null) {
 		const value = Number(seconds ?? 0);
 		return value.toFixed(1);
+	}
+
+	function formatCredits(amount?: number | null) {
+		const value = Number(amount ?? 0);
+		return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+	}
+
+	function formatInteger(value?: number | null) {
+		return Number(value ?? 0).toLocaleString();
+	}
+
+	function displayCredits(value: number, unlimited = false) {
+		return unlimited ? 'Unlimited' : formatCredits(value);
 	}
 
 	function jobStatusLabel(job: Job) {
@@ -114,6 +136,52 @@
 		const [file] = input.files ?? [];
 		selectedFile = file ?? null;
 		resetMessages();
+		if (selectedFile) {
+			refreshEstimate();
+		} else {
+			clearEstimate();
+		}
+	}
+
+	function clearEstimate() {
+		estimateRequestId += 1;
+		estimate = null;
+		estimateError = null;
+		estimateBusy = false;
+	}
+
+	async function refreshEstimate() {
+		if (!selectedFile || uploading) {
+			clearEstimate();
+			return;
+		}
+
+		const requestId = ++estimateRequestId;
+		estimateBusy = true;
+		estimateError = null;
+		estimate = null;
+
+		const formData = new FormData();
+		formData.append('file', selectedFile);
+
+		const response = await apiRequest<JobEstimatePreview>('/jobs/estimate', {
+			method: 'POST',
+			body: formData
+		});
+
+		if (requestId !== estimateRequestId) {
+			return;
+		}
+
+		estimateBusy = false;
+
+		if (!response.ok || !response.data) {
+			estimate = null;
+			estimateError = response.error ?? 'Credits konnten nicht geschätzt werden.';
+			return;
+		}
+
+		estimate = response.data;
 	}
 
 	async function submitJob() {
@@ -140,33 +208,46 @@
 			return;
 		}
 
-		const formData = new FormData();
-		formData.append('alias', trimmedAlias);
-		formData.append('file', selectedFile);
+	const formData = new FormData();
+	formData.append('alias', trimmedAlias);
+	formData.append('file', selectedFile);
 
 		uploading = true;
 
-		const response = await apiRequest<UploadResponse>('/upload', {
-			method: 'POST',
-			body: formData
-		});
+	const response = await apiRequest<UploadResponse>('/upload', {
+		method: 'POST',
+		body: formData
+	});
 
-		if (!response.ok) {
-			errorMessage = response.error ?? 'Upload failed. Please try again.';
-			uploading = false;
-			return;
-		}
-
-		const jobId = response.data?.id ?? '(unknown id)';
-		successMessage = `Job ${jobId} submitted successfully.`;
-		alias = '';
-		selectedFile = null;
-		if (fileInput) {
-			fileInput.value = '';
-		}
-		await fetchJobs();
+	if (!response.ok) {
+		errorMessage = response.error ?? 'Upload failed. Please try again.';
 		uploading = false;
+		return;
 	}
+
+	const jobId = response.data?.id ?? '(unknown id)';
+	const estimateSnapshot = estimate;
+	const estimatedCostMessage = estimateSnapshot
+		? user?.role === 'admin' || user?.unlimited
+			? ' Keine Verrechnung (admin/unlimited).'
+			: ` Geschätzte Kosten: ${formatCredits(
+				estimateSnapshot.charged_credits
+			)} Credits.`
+		: '';
+	successMessage = `Job ${jobId} submitted successfully.${estimatedCostMessage}`;
+	alias = '';
+	selectedFile = null;
+	if (fileInput) {
+		fileInput.value = '';
+	}
+	await fetchJobs();
+	const profileRefresh = await apiRequest<SessionUser>('profile');
+	if (profileRefresh.ok && profileRefresh.data) {
+		user = profileRefresh.data;
+	}
+	clearEstimate();
+	uploading = false;
+}
 
 	async function cancelJob(job: Job) {
 		if (jobActionBusy) return;
@@ -226,6 +307,10 @@
 				<span class="badge">Admin</span>
 			{/if}
 		</p>
+		<p class="description">
+			Credits available:
+			<strong>{displayCredits(user.credits, user.unlimited)}</strong>
+		</p>
 	{/if}
 
 	<div class="toolbar">
@@ -267,6 +352,21 @@
 					{uploading ? 'Uploading…' : 'Start job'}
 				</button>
 
+				{#if estimateBusy}
+					<span class="message">Credits werden geschätzt…</span>
+				{:else if estimate}
+					<span class="message">
+						Kreditbedarf:&nbsp;<strong>
+							{user?.role === 'admin' || user?.unlimited
+								? 'Keine Verrechnung'
+								: `${formatCredits(estimate.charged_credits)} Credits`}
+						</strong>
+						&nbsp;| Laufzeit≈ {formatDuration(estimate.estimated_runtime_seconds)}&nbsp;s · Elemente: {formatInteger(estimate.element_count)}
+					</span>
+				{:else if estimateError}
+					<span class="message error">{estimateError}</span>
+				{/if}
+
 				{#if successMessage}
 					<span class="message success">{successMessage}</span>
 				{/if}
@@ -290,6 +390,7 @@
 						<th>ID &amp; Details</th>
 						<th>Status</th>
 						<th>Duration&nbsp;(s)</th>
+						<th>Credits</th>
 						<th>Actions</th>
 					</tr>
 				</thead>
@@ -306,6 +407,9 @@
 									{#if job.job_type}
 										<span>Type: {job.job_type}</span>
 									{/if}
+									<span>Est. runtime: {formatDuration(job.estimated_runtime_seconds)} s</span>
+									<span>Elements: {formatInteger(job.element_count)}</span>
+									<span>Est. credits: {formatCredits(job.estimated_credits)}</span>
 									{#if job.error}
 										<span class="message error">Error: {job.error}</span>
 									{/if}
@@ -315,6 +419,7 @@
 								<span class={jobStatusClass(job)}>{jobStatusLabel(job)}</span>
 							</td>
 							<td>{formatDuration(job.duration_seconds)}</td>
+							<td>{formatCredits(job.charged_credits)}</td>
 							<td class="actions-cell">
 								{#if job.running}
 									<button

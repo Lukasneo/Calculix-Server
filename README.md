@@ -15,9 +15,11 @@ Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust 
 
 ## Features
 - Upload CalculiX `*.inp` models and run them inside isolated job directories (`/data/jobs/<uuid>`).
+- Give every run a human-readable alias so you can identify jobs without memorising UUIDs.
 - Monitor job list with live durations, status, optional step-type detection, and solver logs.
 - Cancel running jobs and delete finished/cancelled jobs (including all generated files).
 - Download zipped job artefacts (logs, `.frd`, `.dat`, etc.) directly from the UI.
+- Email/password accounts with JWT sessions, role-based access and a pre-seeded `admin@mail.com` (`admin`) login.
 - Frontend served by the backend; no separate web server required.
 
 ## Tech Stack

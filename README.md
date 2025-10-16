@@ -32,10 +32,10 @@ Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust 
 A ready-to-run image is available on Docker Hub for `linux/amd64` hosts:
 
 ```bash
-docker pull lukasneo/calculix-server:amd64
+docker pull lukasneo/calculix-server:v1.1
 ```
 
-Re-tag the image if desired, e.g. `docker tag lukasneo/calculix-server:amd64 calculix-server:latest`.
+Re-tag the image if desired, e.g. `docker tag lukasneo/calculix-server:v1.1 calculix-server:latest`.
 
 ## Configuration
 Environment variables (set in `docker-compose.yml` or your orchestration system):
@@ -73,7 +73,7 @@ Mount the host directory `./data` into the container to persist results between 
    - Update `CCX_THREADS` to match your CPU.
    - Adjust `UPLOAD_LIMIT_GB` if you expect large uploads.
 
-3. **Start the stack** (uses `lukasneo/calculix-server:amd64`)
+3. **Start the stack** (uses `lukasneo/calculix-server:v1.1`)
    ```bash
    docker compose up -d
    ```
@@ -93,7 +93,7 @@ Mount the host directory `./data` into the container to persist results between 
 If you prefer manual control without Compose:
 ```bash
 # Fetch the prebuilt image
-docker pull lukasneo/calculix-server:amd64
+docker pull lukasneo/calculix-server:v1.1
 
 # Run container
 docker run --rm \

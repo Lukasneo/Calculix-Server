@@ -1,4 +1,4 @@
-FROM rust:1.80-bullseye AS backend-builder
+FROM rust:1.84-bookworm AS backend-builder
 WORKDIR /app/backend
 COPY backend ./
 RUN cargo build --release --locked

@@ -1,113 +1,184 @@
-# [CalculiX](https://www.calculix.de) Server
+# ⚙️ CalculiX Server
 
-Dockerized web interface for running CalculiX (ccx) FEM simulations with a Rust backend and SvelteKit frontend.
+A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](https://www.calculix.de) FEM simulations — powered by a **Rust backend** and **SvelteKit frontend**.
 
-## Table of Contents
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Prebuilt Docker Image](#prebuilt-docker-image)
-- [Configuration](#configuration)
-- [Directory Layout](#directory-layout)
-- [Getting Started](#getting-started)
-- [Manual Docker Commands](#manual-docker-commands)
-- [Development Notes](#development-notes)
-- [License](#license)
+![CalculiX Server Screenshot](./interface.jpeg)
 
-## Features
-- Upload CalculiX `*.inp` models and run them inside isolated job directories (`/data/jobs/<uuid>`).
-- Give every run a human-readable alias so you can identify jobs without memorising UUIDs.
-- Monitor job list with live durations, status, optional step-type detection, and solver logs.
-- Cancel running jobs and delete finished/cancelled jobs (including all generated files).
-- Download zipped job artefacts (logs, `.frd`, `.dat`, etc.) directly from the UI.
-- Email/password accounts with JWT sessions, role-based access and a pre-seeded `admin@mail.com` (`admin`) login.
-- Frontend served by the backend; no separate web server required.
+---
 
-## Tech Stack
-- Backend: Rust, Axum, Tokio, tower-http.
-- Frontend: SvelteKit, static adapter.
-- CalculiX installed in the container (`calculix-ccx` package on Debian bookworm).
-- Deployment: Docker multi-stage build + `docker compose`.
+## 📚 Table of Contents
+- [Overview](#-overview)
+- [Features](#-features)
+- [Tech Stack](#-tech-stack)
+- [Prebuilt Docker Image](#-prebuilt-docker-image)
+- [Configuration](#️-configuration)
+- [Directory Layout](#-directory-layout)
+- [Quick Start](#-quick-start)
+  - [Option 1 — Docker Compose](#-option-1--using-docker-compose-recommended)
+  - [Option 2 — Manual Docker Run](#-option-2--manual-docker-command)
+- [Development](#-development)
+- [License](#-license)
+- [Acknowledgment](#-acknowledgment)
 
-## Prebuilt Docker Image
-A ready-to-run image is available on Docker Hub for `linux/amd64` hosts:
+---
+
+## 🧩 Overview
+
+CalculiX Server lets you upload `.inp` models, run them in isolated job folders, and monitor their progress directly in the browser.  
+Each job runs inside a secure Docker container with configurable thread and upload limits.  
+
+---
+
+## 🚀 Features
+
+- Upload and run CalculiX `.inp` models directly from the browser.  
+- Each simulation is stored in `/data/jobs/<uuid>` with all result files.  
+- Give each run a **custom alias** (e.g. “Beam Test”) instead of a random hash.  
+- View real-time job status, duration, solver log, and outputs.  
+- Cancel or delete simulations via the web UI.  
+- Download results (`.frd`, `.dat`, logs, etc.) as a ZIP archive.  
+- User accounts with **email/password login** and admin management.  
+- Admin dashboard to view, lock, or delete user accounts.  
+- Everything runs in **one container** — no external web server or database needed.  
+
+---
+
+## 🧠 Tech Stack
+
+| Component | Technology |
+|------------|-------------|
+| Backend | Rust (Axum, Tokio, tower-http) |
+| Frontend | SvelteKit (static adapter) |
+| Solver | CalculiX (`calculix-ccx`, Debian Bookworm) |
+| Deployment | Multi-stage Docker build (Rust + Node → Debian runtime) |
+
+---
+
+## 🐳 Prebuilt Docker Image
+
+A prebuilt image is available for `linux/amd64` on Docker Hub:
 
 ```bash
 docker pull lukasneo/calculix-server:v1.1
 ```
 
-Re-tag the image if desired, e.g. `docker tag lukasneo/calculix-server:v1.1 calculix-server:latest`.
+You can optionally retag it for convenience:
 
-## Configuration
-Environment variables (set in `docker-compose.yml` or your orchestration system):
+```bash
+docker tag lukasneo/calculix-server:v1.1 calculix-server:latest
+```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
+---
+
+## ⚙️ Configuration
+
+All configuration is handled via **environment variables**:
+
+| Variable | Default | Description |
+|-----------|----------|-------------|
 | `APP_ADDR` | `0.0.0.0:8080` | Bind address for the HTTP server. |
-| `CCX_THREADS` | `8` | Number of threads passed to `ccx -nt`. |
-| `UPLOAD_LIMIT_GB` | `1` | Maximum accepted upload size (GiB). |
-| `FRONTEND_DIST` | `/app/frontend` | Location of built Svelte assets (internal). |
-| `DATA_ROOT` | `/data` | Root directory for job storage (mounted volume). |
+| `CCX_THREADS` | `8` | Threads passed to `ccx -nt`. |
+| `UPLOAD_LIMIT_GB` | `1` | Maximum upload size (in GiB). |
+| `DATA_ROOT` | `/data` | Root directory for job storage. |
+| `FRONTEND_DIST` | `/app/frontend` | Internal path to built Svelte assets. |
 
-Increase `UPLOAD_LIMIT_GB` if you need to accept larger input meshes. Values ≤ `0` or that exceed the platform limit will stop the server at startup with a descriptive error.
+> 💡 If `UPLOAD_LIMIT_GB` is too small or zero, the server refuses to start and prints a clear error message.
 
-## Directory Layout
+---
+
+## 📂 Directory Layout
+
 ```
 /data/
   jobs/
     <uuid>/
       model.inp
       solver.log
-      *.frd / *.dat / other CalculiX outputs
+      *.frd
+      *.dat
+      other CalculiX outputs
 ```
 
-Mount the host directory `./data` into the container to persist results between runs.
+Mount your host’s `./data` folder into `/data` to persist results between runs.
 
-## Getting Started
-1. **Clone the repository**
+---
+
+## 🧭 Quick Start
+
+### 🪄 Option 1 — Using Docker Compose (recommended)
+
+1. **Create a working folder**
    ```bash
-   git clone https://github.com/<you>/Calculix-Server.git
-   cd Calculix-Server
+   mkdir calculix-server && cd calculix-server
    ```
 
-2. **Review environment defaults**
-   - Update `CCX_THREADS` to match your CPU.
-   - Adjust `UPLOAD_LIMIT_GB` if you expect large uploads.
+2. **Create a simple `docker-compose.yml`:**
+   ```yaml
+   services:
+     calculix-server:
+       image: lukasneo/calculix-server:v1.1
+       ports:
+         - "8080:8080"
+       environment:
+         - CCX_THREADS=8
+         - UPLOAD_LIMIT_GB=2
+       volumes:
+         - ./data:/data
+   ```
 
-3. **Start the stack** (uses `lukasneo/calculix-server:v1.1`)
+3. **Start it:**
    ```bash
    docker compose up -d
    ```
-   - The backend listens on `http://localhost:8080`.
-   - Job data persists in the `./data` directory.
 
-4. **Submit a job**
-   - Open the web UI.
-   - Upload a `model.inp` file.
-   - Monitor progress in the job list.
+4. **Open the web UI:**
+   ```
+   http://localhost:8080
+   ```
 
-5. **Cancel or delete**
-   - Cancel a running job with the “Cancel” button (sends SIGKILL to `ccx` and marks the job as cancelled).
-   - Delete a finished/cancelled job to remove its directory and entry from memory.
+5. **Login:**  
+   Default credentials →  
+   **Email:** `admin@mail.com`  
+   **Password:** `admin`
 
-## Manual Docker Commands
-If you prefer manual control without Compose:
+---
+
+### 🧩 Option 2 — Manual Docker Command
+
+If you don’t use Compose:
+
 ```bash
-# Fetch the prebuilt image
-docker pull lukasneo/calculix-server:v1.1
-
-# Run container
 docker run --rm \
   -p 8080:8080 \
   -e CCX_THREADS=8 \
   -e UPLOAD_LIMIT_GB=2 \
   -v "$(pwd)/data:/data" \
-  lukasneo/calculix-server:amd64
+  lukasneo/calculix-server:v1.1
 ```
 
-## Development Notes
-- Backend lives in `backend/` (`cargo run` for local debugging).
-- Frontend lives in `frontend/` (`npm run dev` for local preview).
-- The Docker build stages handle release builds for both parts and copy their artefacts into a slim Debian image with CalculiX preinstalled.
+---
 
-## License
-MIT for the server components. CalculiX itself is distributed under the GPL; see `calculix-ccx` package for full terms.
+## 🧱 Development
+
+For local development (non-Docker):
+
+| Component | Command |
+|------------|----------|
+| Backend | `cd backend && cargo run` |
+| Frontend | `cd frontend && npm run dev` |
+
+The Dockerfile builds both parts in release mode and packages them into a small Debian runtime image containing CalculiX.
+
+---
+
+## 📜 License
+
+- **Server code:** MIT License  
+- **CalculiX:** GPL License (via Debian `calculix-ccx` package)
+
+---
+
+## 🫶 Acknowledgment
+
+This project builds upon the open-source [CalculiX](https://www.calculix.de) solver and the Debian `calculix-ccx` package.  
+CalculiX is developed by Guido Dhondt and distributed under the GNU General Public License (GPL).

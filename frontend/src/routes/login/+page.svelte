@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { apiRequest } from '$lib/api';
 	import { onMount } from 'svelte';
 
 	let email = '';
@@ -8,13 +9,9 @@
 	let errorMessage = '';
 
 	async function checkSession() {
-		try {
-			const response = await fetch('/me', { credentials: 'include' });
-			if (response.ok) {
-				await goto('/dashboard');
-			}
-		} catch {
-			/* swallowing connectivity errors is fine here */
+		const response = await apiRequest('profile');
+		if (response.ok) {
+			await goto('/dashboard');
 		}
 	}
 
@@ -30,26 +27,18 @@
 		}
 
 		loading = true;
-		try {
-			const response = await fetch('/login', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				credentials: 'include',
-				body: JSON.stringify({ email, password })
-			});
+		const response = await apiRequest('login', {
+			method: 'POST',
+			json: { email, password }
+		});
+		loading = false;
 
-			if (!response.ok) {
-				const payload = await response.json().catch(() => ({}));
-				errorMessage = payload?.error ?? 'Invalid email or password.';
-				return;
-			}
-
-			await goto('/dashboard');
-		} catch {
-			errorMessage = 'Network error. Please retry in a moment.';
-		} finally {
-			loading = false;
+		if (!response.ok) {
+			errorMessage = response.error ?? 'Invalid email or password.';
+			return;
 		}
+
+		await goto('/dashboard');
 	}
 </script>
 

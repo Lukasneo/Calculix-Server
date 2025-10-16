@@ -1,0 +1,6 @@
+ALTER TABLE users
+ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+
+UPDATE users
+SET active = 1
+WHERE active IS NULL;

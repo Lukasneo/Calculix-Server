@@ -1,13 +1,9 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import Navbar from '$lib/components/Navbar.svelte';
+	import { apiRequest } from '$lib/api';
+	import type { SessionUser } from '$lib/types';
 	import { onDestroy, onMount } from 'svelte';
-
-	type User = {
-		id: number;
-		email: string;
-		role: 'user' | 'admin';
-		created_at: string;
-	};
 
 	type Job = {
 		id: string;
@@ -21,10 +17,14 @@
 		error?: string | null;
 	};
 
+	type UploadResponse = {
+		id: string;
+	};
+
 	const JOB_POLL_INTERVAL = 3000;
 	const MAX_ALIAS_LENGTH = 100;
 
-	let user: User | null = null;
+	let user: SessionUser | null = null;
 	let jobs: Job[] = [];
 	let alias = '';
 	let selectedFile: File | null = null;
@@ -68,35 +68,31 @@
 	}
 
 	async function loadUser() {
-		try {
-			const response = await fetch('/me', { credentials: 'include' });
-			if (!response.ok) {
-				await goto('/login');
-				return;
-			}
-			user = await response.json();
-		} catch {
+		const response = await apiRequest<SessionUser>('profile');
+
+		if (response.status === 0) {
 			errorMessage = 'Unable to reach the server. Please retry.';
 			return;
 		}
+
+		if (!response.ok || !response.data) {
+			await goto('/login');
+			return;
+		}
+
+		user = response.data;
 
 		await fetchJobs();
 		startJobPolling();
 	}
 
 	async function fetchJobs() {
-		try {
-			const response = await fetch('/status', {
-				cache: 'no-store'
-			});
-			if (!response.ok) return;
+		const response = await apiRequest<Job[]>('/status', {
+			cache: 'no-store'
+		});
 
-			const payload = await response.json();
-			if (Array.isArray(payload)) {
-				jobs = payload;
-			}
-		} catch {
-			// ignore polling errors; table will refresh next time
+		if (response.ok && Array.isArray(response.data)) {
+			jobs = response.data;
 		}
 	}
 
@@ -150,32 +146,26 @@
 
 		uploading = true;
 
-		try {
-			const response = await fetch('/upload', {
-				method: 'POST',
-				body: formData
-			});
+		const response = await apiRequest<UploadResponse>('/upload', {
+			method: 'POST',
+			body: formData
+		});
 
-			const payload = await response.json().catch(() => ({}));
-
-			if (!response.ok) {
-				errorMessage = payload?.error ?? 'Upload failed. Please try again.';
-				return;
-			}
-
-			const jobId = payload?.id ?? '(unknown id)';
-			successMessage = `Job ${jobId} submitted successfully.`;
-			alias = '';
-			selectedFile = null;
-			if (fileInput) {
-				fileInput.value = '';
-			}
-			await fetchJobs();
-		} catch {
-			errorMessage = 'Network error while uploading. Please retry.';
-		} finally {
+		if (!response.ok) {
+			errorMessage = response.error ?? 'Upload failed. Please try again.';
 			uploading = false;
+			return;
 		}
+
+		const jobId = response.data?.id ?? '(unknown id)';
+		successMessage = `Job ${jobId} submitted successfully.`;
+		alias = '';
+		selectedFile = null;
+		if (fileInput) {
+			fileInput.value = '';
+		}
+		await fetchJobs();
+		uploading = false;
 	}
 
 	async function cancelJob(job: Job) {
@@ -183,22 +173,17 @@
 		jobActionBusy = true;
 		resetMessages();
 
-		try {
-			const response = await fetch(`/jobs/${job.id}/cancel`, { method: 'POST' });
-			const payload = await response.json().catch(() => ({}));
+		const response = await apiRequest(`/jobs/${job.id}/cancel`, { method: 'POST' });
 
-			if (!response.ok) {
-				errorMessage = payload?.error ?? 'Failed to cancel the job.';
-				return;
-			}
-
-			successMessage = `Cancellation requested for job ${job.id}.`;
-			await fetchJobs();
-		} catch {
-			errorMessage = 'Network error while cancelling. Please retry.';
-		} finally {
+		if (!response.ok) {
+			errorMessage = response.error ?? 'Failed to cancel the job.';
 			jobActionBusy = false;
+			return;
 		}
+
+		successMessage = `Cancellation requested for job ${job.id}.`;
+		await fetchJobs();
+		jobActionBusy = false;
 	}
 
 	async function deleteJob(job: Job) {
@@ -206,36 +191,19 @@
 		jobActionBusy = true;
 		resetMessages();
 
-		try {
-			const response = await fetch(`/jobs/${job.id}`, { method: 'DELETE' });
-			if (!response.ok) {
-				let message = 'Failed to delete the job.';
-				try {
-					const payload = await response.json();
-					message = payload?.error ?? message;
-				} catch {
-					// ignore
-				}
-				errorMessage = message;
-				return;
-			}
+		const response = await apiRequest(`/jobs/${job.id}`, {
+			method: 'DELETE'
+		});
 
-			successMessage = `Job ${job.id} deleted.`;
-			await fetchJobs();
-		} catch {
-			errorMessage = 'Network error while deleting. Please retry.';
-		} finally {
+		if (!response.ok) {
+			errorMessage = response.error ?? 'Failed to delete the job.';
 			jobActionBusy = false;
+			return;
 		}
-	}
 
-	async function handleLogout() {
-		try {
-			await fetch('/logout', { method: 'POST', credentials: 'include' });
-		} catch {
-			/* ignore */
-		}
-		await goto('/login');
+		successMessage = `Job ${job.id} deleted.`;
+		await fetchJobs();
+		jobActionBusy = false;
 	}
 
 	onMount(() => {
@@ -248,10 +216,12 @@
 </script>
 
 <main>
+	<Navbar {user} />
+
 	<h1>Simulation dashboard</h1>
 	{#if user}
 		<p class="description">
-			Signed in as <strong>{user.email}</strong>
+			Manage your CalculiX runs as <strong>{user.email}</strong>
 			{#if user.role === 'admin'}
 				<span class="badge">Admin</span>
 			{/if}
@@ -261,9 +231,6 @@
 	<div class="toolbar">
 		<button class="button ghost" type="button" on:click={fetchJobs}>
 			Refresh
-		</button>
-		<button class="button secondary" type="button" on:click={handleLogout}>
-			Log out
 		</button>
 	</div>
 

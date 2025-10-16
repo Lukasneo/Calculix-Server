@@ -14,9 +14,10 @@ use axum::extract::multipart::Field;
 use axum::extract::DefaultBodyLimit;
 use axum::{
     async_trait,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{FromRef, FromRequestParts, Multipart, Path as AxumPath, State},
-    http::{header, request::Parts, HeaderMap, StatusCode},
+    http::{header, request::Parts, HeaderMap, Request, StatusCode},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
@@ -149,6 +150,7 @@ const AUTH_COOKIE: &str = "auth_token";
 const PASSWORD_MIN_LEN: usize = 8;
 const MAX_ALIAS_LENGTH: usize = 100;
 const DEFAULT_SIM_STATUS: &str = "pending";
+const SETTING_ALLOW_SIGNUPS: &str = "allow_signups";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -184,6 +186,7 @@ struct UserRecord {
     email: String,
     password_hash: String,
     role: String,
+    active: bool,
     created_at: i64,
 }
 
@@ -192,7 +195,35 @@ struct UserResponse {
     id: i64,
     email: String,
     role: UserRole,
+    active: bool,
     created_at: String,
+}
+
+#[derive(Serialize)]
+struct ProfileResponse {
+    id: i64,
+    email: String,
+    role: UserRole,
+    active: bool,
+}
+
+#[derive(Serialize)]
+struct AdminUserResponse {
+    id: i64,
+    email: String,
+    role: UserRole,
+    active: bool,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct SettingsResponse {
+    allow_signups: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsPayload {
+    allow_signups: bool,
 }
 
 impl UserRecord {
@@ -202,6 +233,28 @@ impl UserRecord {
             id: self.id,
             email: self.email,
             role,
+            active: self.active,
+            created_at: format_timestamp(self.created_at)?,
+        })
+    }
+
+    fn into_profile_response(self) -> Result<ProfileResponse, AppError> {
+        let role = UserRole::from_db(&self.role)?;
+        Ok(ProfileResponse {
+            id: self.id,
+            email: self.email,
+            role,
+            active: self.active,
+        })
+    }
+
+    fn into_admin_response(self) -> Result<AdminUserResponse, AppError> {
+        let role = UserRole::from_db(&self.role)?;
+        Ok(AdminUserResponse {
+            id: self.id,
+            email: self.email,
+            role,
+            active: self.active,
             created_at: format_timestamp(self.created_at)?,
         })
     }
@@ -253,6 +306,17 @@ struct LoginPayload {
 }
 
 #[derive(Deserialize)]
+struct UpdateEmailPayload {
+    new_email: String,
+}
+
+#[derive(Deserialize)]
+struct UpdatePasswordPayload {
+    old_password: String,
+    new_password: String,
+}
+
+#[derive(Deserialize)]
 struct SimulationCreatePayload {
     alias: Option<String>,
 }
@@ -279,6 +343,41 @@ impl AuthUser {
     fn is_admin(&self) -> bool {
         self.role.is_admin()
     }
+}
+
+async fn handle_auth_middleware(
+    req: Request<Body>,
+    next: Next,
+    state: AppState,
+    admin_only: bool,
+) -> Result<Response, AppError> {
+    let (mut parts, body) = req.into_parts();
+    let auth = AuthUser::from_request_parts(&mut parts, &state).await?;
+
+    if admin_only && !auth.is_admin() {
+        return Err(AppError::forbidden("Admin access required"));
+    }
+
+    let mut request = Request::from_parts(parts, body);
+    request.extensions_mut().insert(auth);
+
+    Ok(next.run(request).await)
+}
+
+async fn require_auth(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    handle_auth_middleware(req, next, state, false).await
+}
+
+async fn require_admin(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    handle_auth_middleware(req, next, state, true).await
 }
 
 fn normalize_email(input: &str) -> String {
@@ -333,6 +432,10 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(existing) = parts.extensions.get::<AuthUser>() {
+            return Ok(existing.clone());
+        }
+
         let jar = CookieJar::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::unauthorized("Failed to read authentication cookie"))?;
@@ -351,10 +454,16 @@ where
         )
         .map_err(|_| AppError::unauthorized("Invalid or expired authentication token"))?;
 
-        let role = UserRole::from_db(&token_data.claims.role)?;
+        let app_state = AppState::from_ref(state);
+        let user_record = fetch_user_by_id(&app_state.db_pool, token_data.claims.sub).await?;
+        if !user_record.active {
+            return Err(AppError::forbidden("Account deactivated"));
+        }
+
+        let role = UserRole::from_db(&user_record.role)?;
 
         Ok(AuthUser {
-            user_id: token_data.claims.sub,
+            user_id: user_record.id,
             role,
         })
     }
@@ -365,7 +474,7 @@ async fn fetch_user_by_email(
     email: &str,
 ) -> Result<Option<UserRecord>, AppError> {
     query_as::<_, UserRecord>(
-        "SELECT id, email, password_hash, role, created_at FROM users WHERE email = ?",
+        "SELECT id, email, password_hash, role, active, created_at FROM users WHERE email = ?",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -375,7 +484,7 @@ async fn fetch_user_by_email(
 
 async fn fetch_user_by_id(pool: &SqlitePool, user_id: i64) -> Result<UserRecord, AppError> {
     query_as::<_, UserRecord>(
-        "SELECT id, email, password_hash, role, created_at FROM users WHERE id = ?",
+        "SELECT id, email, password_hash, role, active, created_at FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -473,6 +582,59 @@ fn clear_auth_cookie() -> Cookie<'static> {
         .build()
 }
 
+async fn ensure_setting(pool: &SqlitePool, key: &str, default_value: &str) -> Result<()> {
+    query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
+        .bind(key)
+        .bind(default_value)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn set_bool_setting(pool: &SqlitePool, key: &str, value: bool) -> Result<(), AppError> {
+    let stored = if value { "true" } else { "false" };
+    query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .bind(key)
+        .bind(stored)
+        .execute(pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to persist setting {key}: {err}")))?;
+    Ok(())
+}
+
+async fn get_bool_setting(pool: &SqlitePool, key: &str, default: bool) -> Result<bool, AppError> {
+    let result = query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to fetch setting {key}: {err}")))?;
+
+    match result {
+        None => Ok(default),
+        Some((value,)) => Ok(value.eq_ignore_ascii_case("true")),
+    }
+}
+
+async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
+    ensure_setting(pool, SETTING_ALLOW_SIGNUPS, "true").await
+}
+
+fn core_api_router() -> Router<AppState> {
+    Router::new()
+        .route("/register", post(register))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/me", get(me))
+        .route(
+            "/simulations",
+            get(list_simulations).post(create_simulation),
+        )
+        .route(
+            "/simulations/:id",
+            patch(update_simulation).delete(delete_simulation),
+        )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -525,6 +687,10 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to run database migrations")?;
 
+    ensure_default_settings(&db_pool)
+        .await
+        .context("Failed to ensure default application settings")?;
+
     let admin_email =
         env::var("DEFAULT_ADMIN_EMAIL").unwrap_or_else(|_| "admin@mail.com".to_string());
     let admin_password = env::var("DEFAULT_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
@@ -574,26 +740,38 @@ async fn main() -> Result<()> {
         .route("/jobs/:id", delete(delete_job))
         .layer(DefaultBodyLimit::max(max_upload_bytes));
 
-    let api_router = Router::new()
-        .route("/register", post(register))
-        .route("/login", post(login))
-        .route("/logout", post(logout))
-        .route("/me", get(me))
-        .route(
-            "/simulations",
-            get(list_simulations).post(create_simulation),
+    let profile_router = Router::new()
+        .route("/", get(profile))
+        .route("/update_email", post(update_profile_email))
+        .route("/update_password", post(update_profile_password))
+        .route_layer(from_fn_with_state(state.clone(), require_auth));
+
+    let admin_router = Router::new()
+        .route("/users", get(admin_list_users))
+        .route("/users/:id/toggle_active", post(admin_toggle_user_active))
+        .route("/users/:id", delete(admin_delete_user))
+        .nest(
+            "/settings",
+            Router::new().route("/", get(admin_get_settings).post(admin_update_settings)),
         )
-        .route(
-            "/simulations/:id",
-            patch(update_simulation).delete(delete_simulation),
-        );
+        .route_layer(from_fn_with_state(state.clone(), require_admin));
+
+    let public_settings_router = Router::new().route("/", get(public_settings));
+
+    let api_router = core_api_router()
+        .nest("/profile", profile_router)
+        .nest("/admin", admin_router)
+        .nest("/settings", public_settings_router);
+
+    let legacy_router = core_api_router();
 
     let static_service = ServeDir::new(frontend_dir.clone())
         .not_found_service(ServeFile::new(frontend_dir.join("index.html")));
 
     let app = Router::new()
         .merge(upload_router)
-        .merge(api_router)
+        .merge(legacy_router)
+        .nest("/api", api_router)
         .fallback_service(static_service)
         .with_state(state);
 
@@ -627,6 +805,15 @@ async fn register(
         return Err(AppError::bad_request(format!(
             "Password must be at least {PASSWORD_MIN_LEN} characters long"
         )));
+    }
+
+    if count_users(&state.db_pool).await? > 0 {
+        let allow_signups = get_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, true).await?;
+        if !allow_signups {
+            return Err(AppError::forbidden(
+                "Sign ups are currently disabled by an administrator",
+            ));
+        }
     }
 
     if fetch_user_by_email(&state.db_pool, &email).await?.is_some() {
@@ -685,6 +872,10 @@ async fn login(
         .await?
         .ok_or_else(|| AppError::unauthorized("Invalid email or password"))?;
 
+    if !user_record.active {
+        return Err(AppError::forbidden("Account deactivated"));
+    }
+
     let parsed_hash = PasswordHash::new(&user_record.password_hash)
         .map_err(|err| AppError::internal(format!("Invalid stored password hash: {err}")))?;
 
@@ -710,6 +901,183 @@ async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<UserRe
     let record = fetch_user_by_id(&state.db_pool, auth.user_id).await?;
     let response = record.into_response()?;
     Ok(Json(response))
+}
+
+async fn profile(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<ProfileResponse>, AppError> {
+    let record = fetch_user_by_id(&state.db_pool, auth.user_id).await?;
+    Ok(Json(record.into_profile_response()?))
+}
+
+async fn update_profile_email(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<UpdateEmailPayload>,
+) -> Result<Json<ProfileResponse>, AppError> {
+    let new_email = normalize_email(&payload.new_email);
+    if new_email.is_empty() || !new_email.contains('@') {
+        return Err(AppError::bad_request("A valid email address is required"));
+    }
+
+    if let Some(existing) = fetch_user_by_email(&state.db_pool, &new_email).await? {
+        if existing.id != auth.user_id {
+            return Err(AppError::bad_request("Email is already in use"));
+        }
+    }
+
+    query("UPDATE users SET email = ? WHERE id = ?")
+        .bind(&new_email)
+        .bind(auth.user_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to update email: {err}")))?;
+
+    let record = fetch_user_by_id(&state.db_pool, auth.user_id).await?;
+    Ok(Json(record.into_profile_response()?))
+}
+
+async fn update_profile_password(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<UpdatePasswordPayload>,
+) -> Result<StatusCode, AppError> {
+    let UpdatePasswordPayload {
+        old_password,
+        new_password,
+    } = payload;
+
+    if new_password.trim().len() < PASSWORD_MIN_LEN {
+        return Err(AppError::bad_request(format!(
+            "Password must be at least {PASSWORD_MIN_LEN} characters long"
+        )));
+    }
+
+    if old_password.trim().is_empty() {
+        return Err(AppError::bad_request("Current password is required"));
+    }
+
+    if old_password == new_password {
+        return Err(AppError::bad_request(
+            "New password must be different from the current password",
+        ));
+    }
+
+    let record = fetch_user_by_id(&state.db_pool, auth.user_id).await?;
+
+    let parsed_hash = PasswordHash::new(&record.password_hash)
+        .map_err(|err| AppError::internal(format!("Invalid stored password hash: {err}")))?;
+
+    Argon2::default()
+        .verify_password(old_password.as_bytes(), &parsed_hash)
+        .map_err(|_| AppError::bad_request("Current password is incorrect"))?;
+
+    let salt = SaltString::generate(&mut OsRng);
+    let new_password_hash = Argon2::default()
+        .hash_password(new_password.as_bytes(), &salt)
+        .map_err(|err| AppError::internal(format!("Failed to hash password: {err}")))?
+        .to_string();
+
+    query("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(new_password_hash)
+        .bind(auth.user_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to update password: {err}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_list_users(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AdminUserResponse>>, AppError> {
+    let users = query_as::<_, UserRecord>(
+        "SELECT id, email, password_hash, role, active, created_at FROM users ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.db_pool)
+    .await
+    .map_err(|err| AppError::internal(format!("Failed to list users: {err}")))?;
+
+    let response = users
+        .into_iter()
+        .map(|record| record.into_admin_response())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(response))
+}
+
+async fn load_settings(pool: &SqlitePool) -> Result<SettingsResponse, AppError> {
+    let allow_signups = get_bool_setting(pool, SETTING_ALLOW_SIGNUPS, true).await?;
+    Ok(SettingsResponse { allow_signups })
+}
+
+async fn public_settings(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsResponse>, AppError> {
+    Ok(Json(load_settings(&state.db_pool).await?))
+}
+
+async fn admin_get_settings(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsResponse>, AppError> {
+    Ok(Json(load_settings(&state.db_pool).await?))
+}
+
+async fn admin_update_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateSettingsPayload>,
+) -> Result<Json<SettingsResponse>, AppError> {
+    set_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, payload.allow_signups).await?;
+    Ok(Json(load_settings(&state.db_pool).await?))
+}
+
+async fn admin_toggle_user_active(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    AxumPath(user_id): AxumPath<i64>,
+) -> Result<Json<AdminUserResponse>, AppError> {
+    if user_id == auth.user_id {
+        return Err(AppError::bad_request(
+            "You cannot change your own active status",
+        ));
+    }
+
+    let result =
+        query("UPDATE users SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END WHERE id = ?")
+            .bind(user_id)
+            .execute(&state.db_pool)
+            .await
+            .map_err(|err| AppError::internal(format!("Failed to toggle user status: {err}")))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("User not found"));
+    }
+
+    let record = fetch_user_by_id(&state.db_pool, user_id).await?;
+    Ok(Json(record.into_admin_response()?))
+}
+
+async fn admin_delete_user(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    AxumPath(user_id): AxumPath<i64>,
+) -> Result<StatusCode, AppError> {
+    if user_id == auth.user_id {
+        return Err(AppError::bad_request("You cannot delete your own account"));
+    }
+
+    let result = query("DELETE FROM users WHERE id = ?")
+        .bind(user_id)
+        .execute(&state.db_pool)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to delete user: {err}")))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("User not found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_simulations(
@@ -1232,4 +1600,188 @@ fn resolve_upload_limit_bytes() -> Result<usize> {
     }
 
     Ok(bytes as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, extract::State, http::Request as HttpRequest, Json};
+    use axum_extra::extract::cookie::CookieJar;
+    use std::convert::Infallible;
+    use tower::{service_fn, ServiceBuilder, ServiceExt};
+
+    async fn setup_state() -> AppState {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("failed to create in-memory sqlite pool");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("failed to run migrations");
+
+        let jobs_path = std::env::temp_dir().join(format!("calculix-tests-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&jobs_path).expect("failed to create temp jobs dir");
+
+        let jwt_secret = b"test-secret";
+        AppState {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            jobs_dir: Arc::new(jobs_path),
+            ccx_threads: 1,
+            db_pool: pool,
+            jwt_encoding_key: Arc::new(EncodingKey::from_secret(jwt_secret)),
+            jwt_decoding_key: Arc::new(DecodingKey::from_secret(jwt_secret)),
+            jwt_ttl_seconds: 3600,
+        }
+    }
+
+    async fn insert_user(state: &AppState, email: &str, role: UserRole, active: bool) -> i64 {
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default()
+            .hash_password("P@ssword123".as_bytes(), &salt)
+            .expect("failed to hash password")
+            .to_string();
+
+        let result =
+            query("INSERT INTO users (email, password_hash, role, active) VALUES (?, ?, ?, ?)")
+                .bind(email)
+                .bind(password_hash)
+                .bind(role.as_str())
+                .bind(active)
+                .execute(&state.db_pool)
+                .await
+                .expect("failed to insert user");
+
+        result.last_insert_rowid()
+    }
+
+    fn make_cookie_header(token: &str) -> String {
+        format!("{AUTH_COOKIE}={token}")
+    }
+
+    async fn call_with_auth_layer(state: AppState, request: HttpRequest<Body>) -> Response {
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(state, require_auth))
+            .service(service_fn(|_req: HttpRequest<Body>| async {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }))
+            .oneshot(request)
+            .await
+            .expect("service invocation failed")
+    }
+
+    async fn call_with_admin_layer(state: AppState, request: HttpRequest<Body>) -> Response {
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(state, require_admin))
+            .service(service_fn(|_req: HttpRequest<Body>| async {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }))
+            .oneshot(request)
+            .await
+            .expect("service invocation failed")
+    }
+
+    #[tokio::test]
+    async fn profile_requires_authentication_and_active_user() {
+        let state = setup_state().await;
+        let request = HttpRequest::builder()
+            .uri("/api/profile")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = call_with_auth_layer(state.clone(), request).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let active_user_id = insert_user(&state, "active@example.com", UserRole::User, true).await;
+        let (token, _) = create_jwt(&state, active_user_id, UserRole::User)
+            .expect("failed to create token for active user");
+
+        let request = HttpRequest::builder()
+            .uri("/api/profile")
+            .header(header::COOKIE, make_cookie_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = call_with_auth_layer(state.clone(), request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inactive_user_id =
+            insert_user(&state, "inactive@example.com", UserRole::User, false).await;
+        let (token, _) = create_jwt(&state, inactive_user_id, UserRole::User)
+            .expect("failed to create token for inactive user");
+
+        let request = HttpRequest::builder()
+            .uri("/api/profile")
+            .header(header::COOKIE, make_cookie_header(&token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = call_with_auth_layer(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn register_rejected_when_signups_disabled() {
+        let state = setup_state().await;
+        insert_user(&state, "existing@example.com", UserRole::Admin, true).await;
+        set_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, false)
+            .await
+            .expect("failed to disable signups");
+
+        let payload = RegisterPayload {
+            email: "new@example.com".to_string(),
+            password: "StrongPass1!".to_string(),
+        };
+
+        let result = register(State(state.clone()), CookieJar::new(), Json(payload)).await;
+
+        match result {
+            Ok(_) => panic!("registration succeeded despite being disabled"),
+            Err(err) => {
+                assert_eq!(err.status, StatusCode::FORBIDDEN);
+                assert!(
+                    err.message.to_lowercase().contains("disabled"),
+                    "unexpected message: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_non_admin_users() {
+        let state = setup_state().await;
+        let user_id = insert_user(&state, "user@example.com", UserRole::User, true).await;
+        let admin_id = insert_user(&state, "admin@example.com", UserRole::Admin, true).await;
+
+        let (user_token, _) =
+            create_jwt(&state, user_id, UserRole::User).expect("failed to create user token");
+        let (admin_token, _) =
+            create_jwt(&state, admin_id, UserRole::Admin).expect("failed to create admin token");
+
+        let request = HttpRequest::builder()
+            .uri("/api/admin/users")
+            .header(header::COOKIE, make_cookie_header(&user_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = call_with_admin_layer(state.clone(), request).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let request = HttpRequest::builder()
+            .uri("/api/admin/users")
+            .header(header::COOKIE, make_cookie_header(&admin_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = call_with_admin_layer(state, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

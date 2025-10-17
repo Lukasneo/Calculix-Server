@@ -39,6 +39,7 @@ Each job runs inside a secure Docker container with configurable thread and uplo
 - Download results (`.frd`, `.dat`, logs, etc.) as a ZIP archive.  
 - User accounts with **email/password login**, credit balances, and admin management.  
 - Admin dashboard to view, lock, or delete user accounts.  
+- SMTP notifications: configure mail credentials in the admin panel, send test mails, log the last 20 deliveries (sent/failed), and notify job owners when simulations finish.  
 - Everything runs in **one container** — no external web server or database needed.  
 
 ---
@@ -70,13 +71,13 @@ Each job runs inside a secure Docker container with configurable thread and uplo
 A prebuilt image is available for `linux/amd64` on Docker Hub:
 
 ```bash
-docker pull lukasneo/calculix-server:v1.2
+docker pull lukasneo/calculix-server:v1.3
 ```
 
 You can optionally retag it for convenience:
 
 ```bash
-docker tag lukasneo/calculix-server:v1.2 calculix-server:latest
+docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
 ```
 
 ---
@@ -94,6 +95,8 @@ All configuration is handled via **environment variables**:
 | `FRONTEND_DIST` | `/app/frontend` | Internal path to built Svelte assets. |
 
 > 💡 If `UPLOAD_LIMIT_GB` is too small or zero, the server refuses to start and prints a clear error message.
+
+Mail delivery (SMTP) and the public base URL used in notification links are configured from the admin dashboard under **Mail Settings**.
 
 ---
 
@@ -126,8 +129,8 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
 2. **Create a simple `docker-compose.yml`:**
    ```yaml
    services:
-    calculix-server:
-      image: lukasneo/calculix-server:v1.2
+     calculix-server:
+       image: lukasneo/calculix-server:v1.3
        ports:
          - "8080:8080"
        environment:
@@ -164,7 +167,7 @@ docker run --rm \
   -e CCX_THREADS=8 \
   -e UPLOAD_LIMIT_GB=2 \
   -v "$(pwd)/data:/data" \
-  lukasneo/calculix-server:v1.2
+  lukasneo/calculix-server:v1.3
 ```
 
 ---

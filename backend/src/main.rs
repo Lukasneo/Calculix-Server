@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env,
+    io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -25,17 +26,26 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use lettre::{
+    message::{header::ContentType, Mailbox, Message},
+    transport::smtp::authentication::Credentials,
+    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+};
 use password_hash::SaltString;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
 use sqlx::{
     query, query_as,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     FromRow, SqlitePool,
 };
 use std::str::FromStr;
+use tera::{Context as TeraContext, Tera};
 use time::OffsetDateTime;
-use tokio::{fs, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock};
+use tokio::{
+    fs, fs::OpenOptions, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock,
+};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
@@ -52,6 +62,11 @@ struct AppState {
     jwt_encoding_key: Arc<EncodingKey>,
     jwt_decoding_key: Arc<DecodingKey>,
     jwt_ttl_seconds: i64,
+    smtp_config_path: Arc<PathBuf>,
+    smtp_config: Arc<RwLock<Option<SmtpConfig>>>,
+    email_templates: EmailTemplateEngine,
+    mail_log_path: Arc<PathBuf>,
+    mail_base_url: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -104,6 +119,394 @@ struct UploadResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SmtpConfig {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    from_address: String,
+    use_tls: bool,
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 587,
+            username: None,
+            password: None,
+            from_address: String::new(),
+            use_tls: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SmtpConfigInput {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    from_address: String,
+    use_tls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MailStatus {
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MailLogEntry {
+    timestamp: String,
+    to: String,
+    subject: String,
+    template: String,
+    status: MailStatus,
+    error: Option<String>,
+}
+
+fn normalize_optional_field(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_mailbox_address(address: &str, field: &str) -> Result<Mailbox, AppError> {
+    address
+        .parse::<Mailbox>()
+        .map_err(|err| AppError::bad_request(format!("Invalid {field}: {err}")))
+}
+
+fn normalize_smtp_config(input: SmtpConfigInput) -> Result<SmtpConfig, AppError> {
+    let host = input.host.trim().to_string();
+    if host.is_empty() {
+        return Err(AppError::bad_request("SMTP host is required"));
+    }
+
+    if input.port == 0 {
+        return Err(AppError::bad_request(
+            "SMTP port must be between 1 and 65535",
+        ));
+    }
+
+    let from_address = input.from_address.trim().to_string();
+    if from_address.is_empty() {
+        return Err(AppError::bad_request("SMTP from address is required"));
+    }
+    parse_mailbox_address(&from_address, "from address")?;
+
+    if let Some(username) = &input.username {
+        if username.trim().is_empty() {
+            return Err(AppError::bad_request("SMTP username cannot be empty"));
+        }
+    }
+
+    let username = normalize_optional_field(input.username);
+    let password = normalize_optional_field(input.password);
+
+    Ok(SmtpConfig {
+        host,
+        port: input.port,
+        username,
+        password,
+        from_address,
+        use_tls: input.use_tls,
+    })
+}
+
+#[derive(Clone)]
+struct EmailTemplateEngine {
+    tera: Arc<Tera>,
+}
+
+impl EmailTemplateEngine {
+    fn new(base_dir: &Path) -> Result<Self, AppError> {
+        let resolved = base_dir.canonicalize().map_err(|err| {
+            AppError::internal(format!(
+                "Failed to resolve email template directory ({}): {err}",
+                base_dir.display()
+            ))
+        })?;
+        let pattern = format!("{}/**/*", resolved.display());
+        let mut tera = Tera::new(&pattern)
+            .map_err(|err| AppError::internal(format!("Failed to load email templates: {err}")))?;
+        tera.autoescape_on(vec![".html", ".htm"]);
+        Ok(Self {
+            tera: Arc::new(tera),
+        })
+    }
+
+    fn render<T: Serialize>(&self, template: &str, data: &T) -> Result<String, AppError> {
+        let context = TeraContext::from_serialize(data).map_err(|err| {
+            AppError::internal(format!("Failed to serialise email template context: {err}"))
+        })?;
+
+        self.tera.render(template, &context).map_err(|err| {
+            AppError::internal(format!("Failed to render template {template}: {err}"))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct JobCompletionEmail {
+    job_id: Uuid,
+    owner_id: i64,
+    alias: String,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    duration_seconds: f64,
+    credits_used: f64,
+}
+
+fn format_duration_hms(duration_seconds: f64) -> String {
+    let total_seconds = if duration_seconds.is_finite() && duration_seconds > 0.0 {
+        duration_seconds.floor() as u64
+    } else {
+        0
+    };
+
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn normalize_mail_base_url(input: &str) -> Result<Option<String>, AppError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let value = trimmed.trim_end_matches('/').trim().to_string();
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err(AppError::bad_request(
+            "Mail base URL must start with http:// or https://",
+        ));
+    }
+
+    Ok(Some(value))
+}
+
+fn compose_mail_link(base: Option<&String>, fallback_path: &str) -> String {
+    match base {
+        Some(base_url) if !base_url.is_empty() => base_url.clone(),
+        _ => {
+            if fallback_path.starts_with('/') {
+                fallback_path.to_string()
+            } else {
+                format!("/{}", fallback_path)
+            }
+        }
+    }
+}
+
+async fn load_smtp_config_from_disk(path: &Path) -> Result<Option<SmtpConfig>, AppError> {
+    match fs::read(path).await {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let raw: SmtpConfigInput = serde_json::from_slice(&bytes).map_err(|err| {
+                AppError::internal(format!("Failed to parse SMTP config file: {err}"))
+            })?;
+            let config = match normalize_smtp_config(raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Err(AppError::internal(format!(
+                        "Stored SMTP config is invalid: {}",
+                        err.message
+                    )))
+                }
+            };
+            Ok(Some(config))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(AppError::internal(format!(
+            "Failed to read SMTP config file: {err}"
+        ))),
+    }
+}
+
+async fn persist_smtp_config(path: &Path, config: &SmtpConfig) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await.map_err(|err| {
+            AppError::internal(format!("Failed to prepare SMTP config path: {err}"))
+        })?;
+    }
+
+    let mut payload = serde_json::to_vec_pretty(config)
+        .map_err(|err| AppError::internal(format!("Failed to serialise SMTP config: {err}")))?;
+    payload.push(b'\n');
+
+    fs::write(path, payload)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to write SMTP config: {err}")))?;
+
+    Ok(())
+}
+
+fn build_smtp_transport(
+    config: &SmtpConfig,
+) -> Result<AsyncSmtpTransport<Tokio1Executor>, AppError> {
+    let host = config.host.trim();
+    let mut builder = if config.use_tls {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+            .map_err(|err| AppError::bad_request(format!("Failed to configure SMTP relay: {err}")))?
+            .port(config.port)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host).port(config.port)
+    };
+
+    if let Some(username) = &config.username {
+        let password = config.password.clone().unwrap_or_default();
+        builder = builder.credentials(Credentials::new(username.clone(), password));
+    }
+
+    Ok(builder.build())
+}
+
+async fn append_mail_log(path: &Path, entry: &MailLogEntry) -> Result<(), AppError> {
+    let mut payload = serde_json::to_vec(entry)
+        .map_err(|err| AppError::internal(format!("Failed to serialise mail log entry: {err}")))?;
+    payload.push(b'\n');
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to open mail log: {err}")))?;
+
+    file.write_all(&payload)
+        .await
+        .map_err(|err| AppError::internal(format!("Failed to write mail log: {err}")))?;
+
+    Ok(())
+}
+
+async fn send_templated_email(
+    state: &AppState,
+    recipient: &str,
+    subject: &str,
+    template: &str,
+    variables: JsonValue,
+) -> Result<(), AppError> {
+    let timestamp = Utc::now().to_rfc3339();
+    let mut log_entry = MailLogEntry {
+        timestamp,
+        to: recipient.to_string(),
+        subject: subject.to_string(),
+        template: template.to_string(),
+        status: MailStatus::Sent,
+        error: None,
+    };
+
+    let result: Result<(), AppError> = async {
+        let config = {
+            let guard = state.smtp_config.read().await;
+            guard.clone()
+        }
+        .ok_or_else(|| AppError::bad_request("Configure SMTP settings before sending mail"))?;
+
+        let body = state.email_templates.render(template, &variables)?;
+
+        let transport = build_smtp_transport(&config)?;
+
+        let from_mailbox = parse_mailbox_address(&config.from_address, "from address")?;
+        let to_mailbox = parse_mailbox_address(recipient, "recipient")?;
+
+        let message = Message::builder()
+            .from(from_mailbox)
+            .to(to_mailbox)
+            .subject(subject)
+            .header(ContentType::TEXT_HTML)
+            .body(body)
+            .map_err(|err| AppError::internal(format!("Failed to build email: {err}")))?;
+
+        transport
+            .send(message)
+            .await
+            .map_err(|err| AppError::internal(format!("Failed to send email: {err}")))?;
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = &result {
+        log_entry.status = MailStatus::Failed;
+        log_entry.error = Some(err.message.clone());
+    }
+
+    if let Err(log_err) = append_mail_log(state.mail_log_path.as_ref(), &log_entry).await {
+        warn!("Failed to append mail log entry: {}", log_err.message);
+    }
+
+    result
+}
+
+async fn send_smtp_test_email(state: &AppState, recipient: &str) -> Result<(), AppError> {
+    let now = Utc::now();
+    let base = state.mail_base_url.read().await.clone();
+    let link = compose_mail_link(base.as_ref(), "/");
+
+    let payload = json!({
+        "alias": "Test Simulation",
+        "start_time": now.to_rfc3339(),
+        "end_time": now.to_rfc3339(),
+        "duration": "0s",
+        "credits_used": 0,
+        "link": link
+    });
+
+    send_templated_email(
+        state,
+        recipient,
+        "Calculix Server SMTP Test",
+        "test_email.html",
+        payload,
+    )
+    .await
+}
+
+async fn notify_job_completion(
+    state: &AppState,
+    payload: JobCompletionEmail,
+) -> Result<(), AppError> {
+    let user = fetch_user_by_id(&state.db_pool, payload.owner_id).await?;
+    let duration = format_duration_hms(payload.duration_seconds);
+    let base = state.mail_base_url.read().await.clone();
+    let link = compose_mail_link(base.as_ref(), &format!("/jobs/{}", payload.job_id));
+
+    let context = json!({
+        "alias": payload.alias,
+        "start_time": payload.start_time.to_rfc3339(),
+        "end_time": payload.end_time.to_rfc3339(),
+        "duration": duration,
+        "credits_used": format!("{:.3}", payload.credits_used),
+        "link": link,
+    });
+
+    let subject = format!("Simulation \"{}\" finished", payload.alias);
+    send_templated_email(
+        state,
+        &user.email,
+        &subject,
+        "simulation_finished.html",
+        context,
+    )
+    .await
 }
 
 #[derive(Debug)]
@@ -169,7 +572,9 @@ const DEFAULT_SIM_STATUS: &str = "pending";
 const SETTING_ALLOW_SIGNUPS: &str = "allow_signups";
 const SETTING_BENCHMARK_SCORE: &str = "benchmark_score";
 const SETTING_BENCHMARK_RECORDED_AT: &str = "benchmark_recorded_at";
+const SETTING_MAIL_BASE_URL: &str = "mail_base_url";
 const BENCHMARK_INPUT_PATH: &str = "/app/benchmark.inp";
+const EMAIL_TEMPLATE_DIR: &str = "/app/templates/email";
 const CREDIT_REFERENCE_SCORE: f64 = 0.01;
 const CREDIT_SECONDS_PER_ELEMENT: f64 = 0.02;
 const CREDIT_MIN_ESTIMATED_RUNTIME: f64 = 5.0;
@@ -251,6 +656,7 @@ struct AdminUserResponse {
 #[derive(Serialize)]
 struct SettingsResponse {
     allow_signups: bool,
+    mail_base_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -386,7 +792,8 @@ struct JobEstimatePreviewResponse {
 
 #[derive(Deserialize)]
 struct UpdateSettingsPayload {
-    allow_signups: bool,
+    allow_signups: Option<bool>,
+    mail_base_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -802,7 +1209,9 @@ async fn get_bool_setting(pool: &SqlitePool, key: &str, default: bool) -> Result
 }
 
 async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
-    ensure_setting(pool, SETTING_ALLOW_SIGNUPS, "true").await
+    ensure_setting(pool, SETTING_ALLOW_SIGNUPS, "true").await?;
+    ensure_setting(pool, SETTING_MAIL_BASE_URL, "").await?;
+    Ok(())
 }
 
 async fn set_string_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), AppError> {
@@ -983,6 +1392,35 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to ensure /data/jobs directory exists")?;
 
+    let config_dir = data_root.join("config");
+    fs::create_dir_all(&config_dir)
+        .await
+        .context("Failed to ensure /data/config directory exists")?;
+
+    let smtp_config_path = config_dir.join("smtp.json");
+    let initial_smtp_config = load_smtp_config_from_disk(&smtp_config_path)
+        .await
+        .map_err(|err| anyhow!("Failed to load SMTP config: {}", err.message))?;
+
+    let email_template_base = [
+        PathBuf::from(EMAIL_TEMPLATE_DIR),
+        PathBuf::from("app/templates/email"),
+        PathBuf::from("../app/templates/email"),
+        PathBuf::from("templates/email"),
+        PathBuf::from("../templates/email"),
+        PathBuf::from("backend/templates/email"),
+    ]
+    .into_iter()
+    .find(|dir| dir.is_dir())
+    .ok_or_else(|| {
+        anyhow!("Email templates directory not found (expected at {EMAIL_TEMPLATE_DIR})")
+    })?;
+
+    let email_templates = EmailTemplateEngine::new(&email_template_base)
+        .map_err(|err| anyhow!("Failed to initialise email templates: {}", err.message))?;
+
+    let mail_log_path = data_root.join("mail.log");
+
     let ccx_threads = env::var("CCX_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1021,6 +1459,18 @@ async fn main() -> Result<()> {
     ensure_default_settings(&db_pool)
         .await
         .context("Failed to ensure default application settings")?;
+
+    let mail_base_url = get_string_setting(&db_pool, SETTING_MAIL_BASE_URL)
+        .await
+        .map_err(|err| anyhow!("Failed to load mail base URL: {}", err.message))?
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.trim_end_matches('/').trim().to_string())
+            }
+        });
 
     let admin_email =
         env::var("DEFAULT_ADMIN_EMAIL").unwrap_or_else(|_| "admin@mail.com".to_string());
@@ -1061,6 +1511,11 @@ async fn main() -> Result<()> {
         jwt_encoding_key,
         jwt_decoding_key,
         jwt_ttl_seconds,
+        smtp_config_path: Arc::new(smtp_config_path),
+        smtp_config: Arc::new(RwLock::new(initial_smtp_config)),
+        email_templates,
+        mail_log_path: Arc::new(mail_log_path),
+        mail_base_url: Arc::new(RwLock::new(mail_base_url)),
     };
 
     let upload_router = Router::new()
@@ -1093,6 +1548,10 @@ async fn main() -> Result<()> {
             "/settings",
             Router::new().route("/", get(admin_get_settings).post(admin_update_settings)),
         )
+        .route("/smtp", get(admin_get_smtp_config))
+        .route("/smtp/save", post(admin_save_smtp_config))
+        .route("/smtp/test", post(admin_send_smtp_test))
+        .route("/mail/log", get(admin_get_mail_log))
         .route_layer(from_fn_with_state(state.clone(), require_admin));
 
     let public_settings_router = Router::new().route("/", get(public_settings));
@@ -1357,7 +1816,21 @@ async fn admin_list_users(
 
 async fn load_settings(pool: &SqlitePool) -> Result<SettingsResponse, AppError> {
     let allow_signups = get_bool_setting(pool, SETTING_ALLOW_SIGNUPS, true).await?;
-    Ok(SettingsResponse { allow_signups })
+    let mail_base_url = match get_string_setting(pool, SETTING_MAIL_BASE_URL).await? {
+        Some(value) => match normalize_mail_base_url(&value) {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("Stored mail base URL is invalid: {}", err.message);
+                None
+            }
+        },
+        None => None,
+    };
+
+    Ok(SettingsResponse {
+        allow_signups,
+        mail_base_url,
+    })
 }
 
 async fn public_settings(
@@ -1376,8 +1849,97 @@ async fn admin_update_settings(
     State(state): State<AppState>,
     Json(payload): Json<UpdateSettingsPayload>,
 ) -> Result<Json<SettingsResponse>, AppError> {
-    set_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, payload.allow_signups).await?;
+    if let Some(value) = payload.allow_signups {
+        set_bool_setting(&state.db_pool, SETTING_ALLOW_SIGNUPS, value).await?;
+    }
+
+    if let Some(raw_base_url) = payload.mail_base_url {
+        let normalized = normalize_mail_base_url(&raw_base_url)?;
+        let stored = normalized.clone().unwrap_or_default();
+        set_string_setting(&state.db_pool, SETTING_MAIL_BASE_URL, &stored).await?;
+
+        let mut guard = state.mail_base_url.write().await;
+        *guard = normalized;
+    }
+
     Ok(Json(load_settings(&state.db_pool).await?))
+}
+
+async fn admin_get_smtp_config(
+    State(state): State<AppState>,
+) -> Result<Json<SmtpConfig>, AppError> {
+    let current = state
+        .smtp_config
+        .read()
+        .await
+        .clone()
+        .unwrap_or_else(SmtpConfig::default);
+    Ok(Json(current))
+}
+
+async fn admin_save_smtp_config(
+    State(state): State<AppState>,
+    Json(payload): Json<SmtpConfigInput>,
+) -> Result<Json<SmtpConfig>, AppError> {
+    let config = normalize_smtp_config(payload)?;
+    persist_smtp_config(&state.smtp_config_path, &config).await?;
+
+    {
+        let mut guard = state.smtp_config.write().await;
+        *guard = Some(config.clone());
+    }
+
+    info!("SMTP configuration updated");
+    Ok(Json(config))
+}
+
+async fn admin_send_smtp_test(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<StatusCode, AppError> {
+    let recipient = fetch_user_by_id(&state.db_pool, auth.user_id).await?.email;
+
+    send_smtp_test_email(&state, &recipient).await?;
+    info!("SMTP test email triggered for {recipient}");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_get_mail_log(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<MailLogEntry>>, AppError> {
+    let data = match fs::read(state.mail_log_path.as_ref()).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Json(Vec::new())),
+        Err(err) => {
+            return Err(AppError::internal(format!(
+                "Failed to read mail log: {err}"
+            )))
+        }
+    };
+
+    if data.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let content = String::from_utf8(data)
+        .map_err(|err| AppError::internal(format!("Mail log contains invalid UTF-8: {err}")))?;
+
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<MailLogEntry>(trimmed) {
+            Ok(entry) => entries.push(entry),
+            Err(err) => warn!("Failed to parse mail log entry: {err}"),
+        }
+    }
+
+    let recent: Vec<MailLogEntry> = entries.into_iter().rev().take(20).collect();
+    Ok(Json(recent))
 }
 
 async fn admin_get_user_credits(
@@ -1994,7 +2556,8 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
     };
 
     // Run CalculiX and capture stdout/stderr into solver.log
-    let result = async {
+    let execution = async {
+        let mut completion_notification: Option<JobCompletionEmail> = None;
         let log_file = std::fs::File::create(&log_path)?;
         let log_file_err = log_file.try_clone()?;
 
@@ -2045,6 +2608,15 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
             } else if status.success() {
                 entry.done = true;
                 entry.error = None;
+                completion_notification = Some(JobCompletionEmail {
+                    job_id,
+                    owner_id: entry.owner_id,
+                    alias: entry.alias.clone(),
+                    start_time: entry.started_at,
+                    end_time: Utc::now(),
+                    duration_seconds: entry.duration.unwrap_or_default(),
+                    credits_used: entry.charged_credits,
+                });
                 info!("CalculiX job {job_id} completed successfully");
             } else {
                 entry.done = true;
@@ -2058,25 +2630,33 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
             }
         }
 
-        Result::<Option<(i64, f64)>>::Ok(refund)
+        Ok::<(Option<(i64, f64)>, Option<JobCompletionEmail>), anyhow::Error>((
+            refund,
+            completion_notification,
+        ))
     }
     .await;
 
-    match result {
-        Ok(Some((user_id, amount))) => {
-            if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await {
-                warn!(
-                    "Failed to refund credits for job {} (user {}): {:?}",
-                    job_id, user_id, refund_err
-                );
-            } else {
-                info!(
-                    "Refunded {:.3} credits to user {} after job {} failure",
-                    amount, user_id, job_id
-                );
+    let mut completion_notification = None;
+
+    match execution {
+        Ok((refund, notification)) => {
+            completion_notification = notification;
+            if let Some((user_id, amount)) = refund {
+                if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await
+                {
+                    warn!(
+                        "Failed to refund credits for job {} (user {}): {:?}",
+                        job_id, user_id, refund_err
+                    );
+                } else {
+                    info!(
+                        "Refunded {:.3} credits to user {} after job {} failure",
+                        amount, user_id, job_id
+                    );
+                }
             }
         }
-        Ok(None) => {}
         Err(err) => {
             error!("CalculiX job {job_id} failed to run: {err:?}");
             let mut jobs = state.jobs.write().await;
@@ -2108,6 +2688,15 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
                     );
                 }
             }
+        }
+    }
+
+    if let Some(notification) = completion_notification {
+        if let Err(err) = notify_job_completion(&state, notification).await {
+            warn!(
+                "Failed to send completion email for job {}: {}",
+                job_id, err.message
+            );
         }
     }
 }
@@ -2447,6 +3036,22 @@ mod tests {
         let jobs_path = std::env::temp_dir().join(format!("calculix-tests-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&jobs_path).expect("failed to create temp jobs dir");
 
+        let templates_path = jobs_path.join("templates/email");
+        std::fs::create_dir_all(&templates_path).expect("failed to create temp templates dir");
+        std::fs::write(
+            templates_path.join("simulation_finished.html"),
+            "<p>{{ alias }}</p>",
+        )
+        .expect("failed to write simulation template");
+        std::fs::write(templates_path.join("test_email.html"), "<p>{{ alias }}</p>")
+            .expect("failed to write test template");
+
+        let email_templates =
+            EmailTemplateEngine::new(&templates_path).expect("failed to initialise templates");
+
+        let smtp_config_path = jobs_path.join("smtp.json");
+        let mail_log_path = jobs_path.join("mail.log");
+
         let jwt_secret = b"test-secret";
         AppState {
             jobs: Arc::new(RwLock::new(HashMap::new())),
@@ -2456,6 +3061,11 @@ mod tests {
             jwt_encoding_key: Arc::new(EncodingKey::from_secret(jwt_secret)),
             jwt_decoding_key: Arc::new(DecodingKey::from_secret(jwt_secret)),
             jwt_ttl_seconds: 3600,
+            smtp_config_path: Arc::new(smtp_config_path),
+            smtp_config: Arc::new(RwLock::new(None)),
+            email_templates,
+            mail_log_path: Arc::new(mail_log_path),
+            mail_base_url: Arc::new(RwLock::new(None)),
         }
     }
 

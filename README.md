@@ -1,11 +1,5 @@
 # ⚙️ CalculiX Server
-# ⚙️ CalculiX Server
 
-A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](https://www.calculix.de) FEM simulations — powered by a **Rust backend** and **SvelteKit frontend**.
-
-![CalculiX Server Screenshot](./interface.jpeg)
-
----
 A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](https://www.calculix.de) FEM simulations — powered by a **Rust backend** and **SvelteKit frontend**.
 
 ![CalculiX Server Screenshot](./interface.jpeg)
@@ -91,14 +85,9 @@ docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
 ---
 
 ## ⚙️ Configuration
----
-
-## ⚙️ Configuration
 
 All configuration is handled via **environment variables**:
-All configuration is handled via **environment variables**:
 
-| Variable | Default | Description |
 |-----------|----------|-------------|
 | Variable | Default | Description |
 |-----------|----------|-------------|
@@ -153,13 +142,6 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
 ### 🪄 Option 1 — Using Docker Compose (recommended)
 
 1. **Create a working folder**
----
-
-## 🧭 Quick Start
-
-### 🪄 Option 1 — Using Docker Compose (recommended)
-
-1. **Create a working folder**
    ```bash
    mkdir calculix-server && cd calculix-server
    mkdir calculix-server && cd calculix-server
@@ -180,24 +162,6 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
    ```
 
 3. **Start it:**
-2. **Create a simple `docker-compose.yml`:**
-   ```yaml
-   services:
-     calculix-server:
-       image: lukasneo/calculix-server:v1.3
-       ports:
-         - "8080:8080"
-       environment:
-         - CCX_THREADS=8
-         - UPLOAD_LIMIT_GB=2
-       volumes:
-         - ./data:/data
-   ```
-
-3. **Start it:**
-   ```bash
-   docker compose up -d
-   ```
 
 4. **Open the web UI:**
    ```
@@ -211,22 +175,6 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
 
 ---
 
-### 🧩 Option 2 — Manual Docker Command
-
-If you don’t use Compose:
-
-
-4. **Open the web UI:**
-   ```
-   http://localhost:8080
-   ```
-
-5. **Login:**  
-   Default credentials →  
-   **Email:** `admin@mail.com`  
-   **Password:** `admin`
-
----
 
 ### 🧩 Option 2 — Manual Docker Command
 

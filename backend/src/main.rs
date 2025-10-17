@@ -18,13 +18,7 @@ use axum::{
     extract::{FromRef, FromRequestParts, Multipart, Path as AxumPath, State},
     http::{header, request::Parts, HeaderMap, Request, StatusCode},
     middleware::{from_fn_with_state, Next},
-    async_trait,
-    body::{Body, Bytes},
-    extract::{FromRef, FromRequestParts, Multipart, Path as AxumPath, State},
-    http::{header, request::Parts, HeaderMap, Request, StatusCode},
-    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -51,32 +45,8 @@ use time::OffsetDateTime;
 use tokio::{
     fs, fs::OpenOptions, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock,
 };
-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use chrono::{DateTime, Duration, TimeZone, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use lettre::{
-    message::{header::ContentType, Mailbox, Message},
-    transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-};
-use password_hash::SaltString;
-use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
-use sqlx::{
-    query, query_as,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    FromRow, SqlitePool,
-};
-use std::str::FromStr;
-use tera::{Context as TeraContext, Tera};
-use time::OffsetDateTime;
-use tokio::{
-    fs, fs::OpenOptions, io::AsyncWriteExt, net::TcpListener, process::Command, sync::RwLock,
-};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info, warn};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
@@ -105,8 +75,6 @@ struct JobEntry {
     id: Uuid,
     owner_id: i64,
     alias: String,
-    owner_id: i64,
-    alias: String,
     running: bool,
     done: bool,
     cancelled: bool,
@@ -123,18 +91,11 @@ struct JobEntry {
     benchmark_score: f64,
     estimated_credits: f64,
     charged_credits: f64,
-    element_count: usize,
-    estimated_runtime_seconds: f64,
-    benchmark_score: f64,
-    estimated_credits: f64,
-    charged_credits: f64,
 }
 
 #[derive(Serialize)]
 struct JobSummary {
     id: Uuid,
-    owner_id: i64,
-    alias: String,
     owner_id: i64,
     alias: String,
     running: bool,
@@ -144,11 +105,6 @@ struct JobSummary {
     duration_seconds: f64,
     job_type: Option<String>,
     error: Option<String>,
-    element_count: usize,
-    estimated_runtime_seconds: f64,
-    benchmark_score: f64,
-    estimated_credits: f64,
-    charged_credits: f64,
     element_count: usize,
     estimated_runtime_seconds: f64,
     benchmark_score: f64,
@@ -164,394 +120,6 @@ struct UploadResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SmtpConfig {
-    host: String,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    from_address: String,
-    use_tls: bool,
-}
-
-impl Default for SmtpConfig {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            port: 587,
-            username: None,
-            password: None,
-            from_address: String::new(),
-            use_tls: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SmtpConfigInput {
-    host: String,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    from_address: String,
-    use_tls: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum MailStatus {
-    Sent,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MailLogEntry {
-    timestamp: String,
-    to: String,
-    subject: String,
-    template: String,
-    status: MailStatus,
-    error: Option<String>,
-}
-
-fn normalize_optional_field(value: Option<String>) -> Option<String> {
-    value.and_then(|raw| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn parse_mailbox_address(address: &str, field: &str) -> Result<Mailbox, AppError> {
-    address
-        .parse::<Mailbox>()
-        .map_err(|err| AppError::bad_request(format!("Invalid {field}: {err}")))
-}
-
-fn normalize_smtp_config(input: SmtpConfigInput) -> Result<SmtpConfig, AppError> {
-    let host = input.host.trim().to_string();
-    if host.is_empty() {
-        return Err(AppError::bad_request("SMTP host is required"));
-    }
-
-    if input.port == 0 {
-        return Err(AppError::bad_request(
-            "SMTP port must be between 1 and 65535",
-        ));
-    }
-
-    let from_address = input.from_address.trim().to_string();
-    if from_address.is_empty() {
-        return Err(AppError::bad_request("SMTP from address is required"));
-    }
-    parse_mailbox_address(&from_address, "from address")?;
-
-    if let Some(username) = &input.username {
-        if username.trim().is_empty() {
-            return Err(AppError::bad_request("SMTP username cannot be empty"));
-        }
-    }
-
-    let username = normalize_optional_field(input.username);
-    let password = normalize_optional_field(input.password);
-
-    Ok(SmtpConfig {
-        host,
-        port: input.port,
-        username,
-        password,
-        from_address,
-        use_tls: input.use_tls,
-    })
-}
-
-#[derive(Clone)]
-struct EmailTemplateEngine {
-    tera: Arc<Tera>,
-}
-
-impl EmailTemplateEngine {
-    fn new(base_dir: &Path) -> Result<Self, AppError> {
-        let resolved = base_dir.canonicalize().map_err(|err| {
-            AppError::internal(format!(
-                "Failed to resolve email template directory ({}): {err}",
-                base_dir.display()
-            ))
-        })?;
-        let pattern = format!("{}/**/*", resolved.display());
-        let mut tera = Tera::new(&pattern)
-            .map_err(|err| AppError::internal(format!("Failed to load email templates: {err}")))?;
-        tera.autoescape_on(vec![".html", ".htm"]);
-        Ok(Self {
-            tera: Arc::new(tera),
-        })
-    }
-
-    fn render<T: Serialize>(&self, template: &str, data: &T) -> Result<String, AppError> {
-        let context = TeraContext::from_serialize(data).map_err(|err| {
-            AppError::internal(format!("Failed to serialise email template context: {err}"))
-        })?;
-
-        self.tera.render(template, &context).map_err(|err| {
-            AppError::internal(format!("Failed to render template {template}: {err}"))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct JobCompletionEmail {
-    job_id: Uuid,
-    owner_id: i64,
-    alias: String,
-    start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
-    duration_seconds: f64,
-    credits_used: f64,
-}
-
-fn format_duration_hms(duration_seconds: f64) -> String {
-    let total_seconds = if duration_seconds.is_finite() && duration_seconds > 0.0 {
-        duration_seconds.floor() as u64
-    } else {
-        0
-    };
-
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
-fn normalize_mail_base_url(input: &str) -> Result<Option<String>, AppError> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let value = trimmed.trim_end_matches('/').trim().to_string();
-    if !(value.starts_with("http://") || value.starts_with("https://")) {
-        return Err(AppError::bad_request(
-            "Mail base URL must start with http:// or https://",
-        ));
-    }
-
-    Ok(Some(value))
-}
-
-fn compose_mail_link(base: Option<&String>, fallback_path: &str) -> String {
-    match base {
-        Some(base_url) if !base_url.is_empty() => base_url.clone(),
-        _ => {
-            if fallback_path.starts_with('/') {
-                fallback_path.to_string()
-            } else {
-                format!("/{}", fallback_path)
-            }
-        }
-    }
-}
-
-async fn load_smtp_config_from_disk(path: &Path) -> Result<Option<SmtpConfig>, AppError> {
-    match fs::read(path).await {
-        Ok(bytes) => {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            let raw: SmtpConfigInput = serde_json::from_slice(&bytes).map_err(|err| {
-                AppError::internal(format!("Failed to parse SMTP config file: {err}"))
-            })?;
-            let config = match normalize_smtp_config(raw) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(AppError::internal(format!(
-                        "Stored SMTP config is invalid: {}",
-                        err.message
-                    )))
-                }
-            };
-            Ok(Some(config))
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(AppError::internal(format!(
-            "Failed to read SMTP config file: {err}"
-        ))),
-    }
-}
-
-async fn persist_smtp_config(path: &Path, config: &SmtpConfig) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|err| {
-            AppError::internal(format!("Failed to prepare SMTP config path: {err}"))
-        })?;
-    }
-
-    let mut payload = serde_json::to_vec_pretty(config)
-        .map_err(|err| AppError::internal(format!("Failed to serialise SMTP config: {err}")))?;
-    payload.push(b'\n');
-
-    fs::write(path, payload)
-        .await
-        .map_err(|err| AppError::internal(format!("Failed to write SMTP config: {err}")))?;
-
-    Ok(())
-}
-
-fn build_smtp_transport(
-    config: &SmtpConfig,
-) -> Result<AsyncSmtpTransport<Tokio1Executor>, AppError> {
-    let host = config.host.trim();
-    let mut builder = if config.use_tls {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
-            .map_err(|err| AppError::bad_request(format!("Failed to configure SMTP relay: {err}")))?
-            .port(config.port)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host).port(config.port)
-    };
-
-    if let Some(username) = &config.username {
-        let password = config.password.clone().unwrap_or_default();
-        builder = builder.credentials(Credentials::new(username.clone(), password));
-    }
-
-    Ok(builder.build())
-}
-
-async fn append_mail_log(path: &Path, entry: &MailLogEntry) -> Result<(), AppError> {
-    let mut payload = serde_json::to_vec(entry)
-        .map_err(|err| AppError::internal(format!("Failed to serialise mail log entry: {err}")))?;
-    payload.push(b'\n');
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(|err| AppError::internal(format!("Failed to open mail log: {err}")))?;
-
-    file.write_all(&payload)
-        .await
-        .map_err(|err| AppError::internal(format!("Failed to write mail log: {err}")))?;
-
-    Ok(())
-}
-
-async fn send_templated_email(
-    state: &AppState,
-    recipient: &str,
-    subject: &str,
-    template: &str,
-    variables: JsonValue,
-) -> Result<(), AppError> {
-    let timestamp = Utc::now().to_rfc3339();
-    let mut log_entry = MailLogEntry {
-        timestamp,
-        to: recipient.to_string(),
-        subject: subject.to_string(),
-        template: template.to_string(),
-        status: MailStatus::Sent,
-        error: None,
-    };
-
-    let result: Result<(), AppError> = async {
-        let config = {
-            let guard = state.smtp_config.read().await;
-            guard.clone()
-        }
-        .ok_or_else(|| AppError::bad_request("Configure SMTP settings before sending mail"))?;
-
-        let body = state.email_templates.render(template, &variables)?;
-
-        let transport = build_smtp_transport(&config)?;
-
-        let from_mailbox = parse_mailbox_address(&config.from_address, "from address")?;
-        let to_mailbox = parse_mailbox_address(recipient, "recipient")?;
-
-        let message = Message::builder()
-            .from(from_mailbox)
-            .to(to_mailbox)
-            .subject(subject)
-            .header(ContentType::TEXT_HTML)
-            .body(body)
-            .map_err(|err| AppError::internal(format!("Failed to build email: {err}")))?;
-
-        transport
-            .send(message)
-            .await
-            .map_err(|err| AppError::internal(format!("Failed to send email: {err}")))?;
-
-        Ok(())
-    }
-    .await;
-
-    if let Err(err) = &result {
-        log_entry.status = MailStatus::Failed;
-        log_entry.error = Some(err.message.clone());
-    }
-
-    if let Err(log_err) = append_mail_log(state.mail_log_path.as_ref(), &log_entry).await {
-        warn!("Failed to append mail log entry: {}", log_err.message);
-    }
-
-    result
-}
-
-async fn send_smtp_test_email(state: &AppState, recipient: &str) -> Result<(), AppError> {
-    let now = Utc::now();
-    let base = state.mail_base_url.read().await.clone();
-    let link = compose_mail_link(base.as_ref(), "/");
-
-    let payload = json!({
-        "alias": "Test Simulation",
-        "start_time": now.to_rfc3339(),
-        "end_time": now.to_rfc3339(),
-        "duration": "0s",
-        "credits_used": 0,
-        "link": link
-    });
-
-    send_templated_email(
-        state,
-        recipient,
-        "Calculix Server SMTP Test",
-        "test_email.html",
-        payload,
-    )
-    .await
-}
-
-async fn notify_job_completion(
-    state: &AppState,
-    payload: JobCompletionEmail,
-) -> Result<(), AppError> {
-    let user = fetch_user_by_id(&state.db_pool, payload.owner_id).await?;
-    let duration = format_duration_hms(payload.duration_seconds);
-    let base = state.mail_base_url.read().await.clone();
-    let link = compose_mail_link(base.as_ref(), &format!("/jobs/{}", payload.job_id));
-
-    let context = json!({
-        "alias": payload.alias,
-        "start_time": payload.start_time.to_rfc3339(),
-        "end_time": payload.end_time.to_rfc3339(),
-        "duration": duration,
-        "credits_used": format!("{:.3}", payload.credits_used),
-        "link": link,
-    });
-
-    let subject = format!("Simulation \"{}\" finished", payload.alias);
-    send_templated_email(
-        state,
-        &user.email,
-        &subject,
-        "simulation_finished.html",
-        context,
-    )
-    .await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -966,18 +534,6 @@ impl AppError {
 
     fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
-    }
-
-    fn unauthorized(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, message)
-    }
-
-    fn forbidden(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::FORBIDDEN, message)
-    }
-
-    fn payment_required(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::PAYMENT_REQUIRED, message)
     }
 
     fn unauthorized(message: impl Into<String>) -> Self {
@@ -1938,42 +1494,11 @@ async fn main() -> Result<()> {
         .init();
 
     let data_root = PathBuf::from(env::var("DATA_ROOT").unwrap_or_else(|_| "/data".to_string()));
-    let data_root = PathBuf::from(env::var("DATA_ROOT").unwrap_or_else(|_| "/data".to_string()));
     let jobs_dir = data_root.join("jobs");
     fs::create_dir_all(&jobs_dir)
         .await
         .context("Failed to ensure /data/jobs directory exists")?;
 
-    let config_dir = data_root.join("config");
-    fs::create_dir_all(&config_dir)
-        .await
-        .context("Failed to ensure /data/config directory exists")?;
-
-    let smtp_config_path = config_dir.join("smtp.json");
-    let initial_smtp_config = load_smtp_config_from_disk(&smtp_config_path)
-        .await
-        .map_err(|err| anyhow!("Failed to load SMTP config: {}", err.message))?;
-
-    let email_template_base = [
-        PathBuf::from(EMAIL_TEMPLATE_DIR),
-        PathBuf::from("app/templates/email"),
-        PathBuf::from("../app/templates/email"),
-        PathBuf::from("templates/email"),
-        PathBuf::from("../templates/email"),
-        PathBuf::from("backend/templates/email"),
-    ]
-    .into_iter()
-    .find(|dir| dir.is_dir())
-    .ok_or_else(|| {
-        anyhow!("Email templates directory not found (expected at {EMAIL_TEMPLATE_DIR})")
-    })?;
-
-    let email_templates = EmailTemplateEngine::new(&email_template_base)
-        .map_err(|err| anyhow!("Failed to initialise email templates: {}", err.message))?;
-
-    let mail_log_path = data_root.join("mail.log");
-
-    let ccx_threads = env::var("CCX_THREADS")
     let config_dir = data_root.join("config");
     fs::create_dir_all(&config_dir)
         .await
@@ -2078,74 +1603,6 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|ttl| *ttl > 0)
         .unwrap_or(60 * 60 * 24);
-        PathBuf::from(env::var("FRONTEND_DIST").unwrap_or_else(|_| "frontend/build".into()));
-
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| format!("sqlite://{}", data_root.join("app.db").display()));
-
-    if let Some(sqlite_path) = database_url.strip_prefix("sqlite://") {
-        if let Some(parent) = Path::new(sqlite_path).parent() {
-            fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to ensure database directory {}", parent.display())
-            })?;
-        }
-    }
-
-    let connect_options = SqliteConnectOptions::from_str(&database_url)
-        .context("Failed to parse DATABASE_URL")?
-        .create_if_missing(true);
-
-    let db_pool = SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect_with(connect_options)
-        .await
-        .context("Failed to connect to database")?;
-
-    sqlx::migrate!("./migrations")
-        .run(&db_pool)
-        .await
-        .context("Failed to run database migrations")?;
-
-    ensure_default_settings(&db_pool)
-        .await
-        .context("Failed to ensure default application settings")?;
-
-    let mail_base_url = get_string_setting(&db_pool, SETTING_MAIL_BASE_URL)
-        .await
-        .map_err(|err| anyhow!("Failed to load mail base URL: {}", err.message))?
-        .and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.trim_end_matches('/').trim().to_string())
-            }
-        });
-
-    let admin_email =
-        env::var("DEFAULT_ADMIN_EMAIL").unwrap_or_else(|_| "admin@mail.com".to_string());
-    let admin_password = env::var("DEFAULT_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
-
-    ensure_default_admin(&db_pool, &admin_email, &admin_password)
-        .await
-        .context("Failed to ensure default admin account")?;
-
-    info!("Connected to database at {}", database_url);
-
-    let jwt_secret =
-        env::var("JWT_SECRET").unwrap_or_else(|_| "development-secret-change-me".to_string());
-
-    if jwt_secret == "development-secret-change-me" {
-        info!("JWT_SECRET not set, using development default (do not use in production)");
-    }
-
-    let jwt_encoding_key = Arc::new(EncodingKey::from_secret(jwt_secret.as_bytes()));
-    let jwt_decoding_key = Arc::new(DecodingKey::from_secret(jwt_secret.as_bytes()));
-    let jwt_ttl_seconds = env::var("JWT_TTL_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|ttl| *ttl > 0)
-        .unwrap_or(60 * 60 * 24);
 
     let max_upload_bytes = resolve_upload_limit_bytes()?;
     info!(
@@ -2174,7 +1631,6 @@ async fn main() -> Result<()> {
         .route("/status", get(status))
         .route("/download/:id", get(download))
         .route("/jobs/:id/cancel", post(cancel_job))
-        .route("/jobs/estimate", post(estimate_job_upload_preview))
         .route("/jobs/estimate", post(estimate_job_upload_preview))
         .route("/jobs/:id", delete(delete_job))
         .layer(DefaultBodyLimit::max(max_upload_bytes))
@@ -2237,15 +1693,9 @@ async fn main() -> Result<()> {
         .merge(upload_router)
         .merge(legacy_router)
         .nest("/api", api_router)
-    let app = Router::new()
-        .merge(upload_router)
-        .merge(legacy_router)
-        .nest("/api", api_router)
         .fallback_service(static_service)
         .with_state(state);
-        .with_state(state);
 
-    let addr: SocketAddr = env::var("APP_ADDR")
     let addr: SocketAddr = env::var("APP_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
@@ -3396,11 +2846,8 @@ async fn start_simulation(
 async fn upload(
     State(state): State<AppState>,
     auth: AuthUser,
-    auth: AuthUser,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
-    let mut alias: Option<String> = None;
-
     let mut alias: Option<String> = None;
 
     while let Some(field) = multipart
@@ -3426,42 +2873,11 @@ async fn upload(
                     .ok_or_else(|| {
                         AppError::bad_request("Uploaded file must include a filename")
                     })?;
-        let field_name = field.name().map(|value| value.to_string());
-        match field_name.as_deref() {
-            Some("alias") => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|err| AppError::internal(format!("Failed to read alias: {err}")))?;
-                let normalized = normalize_alias_required(&value)?;
-                alias = Some(normalized);
-            }
-            Some("file") | None => {
-                let file_field = field;
-                let file_name = file_field
-                    .file_name()
-                    .map(|name| name.to_string())
-                    .ok_or_else(|| {
-                        AppError::bad_request("Uploaded file must include a filename")
-                    })?;
 
                 if !file_name.to_lowercase().ends_with(".inp") {
                     return Err(AppError::bad_request("Only .inp files are accepted"));
                 }
-                if !file_name.to_lowercase().ends_with(".inp") {
-                    return Err(AppError::bad_request("Only .inp files are accepted"));
-                }
 
-                let alias = alias
-                    .clone()
-                    .ok_or_else(|| AppError::bad_request("Alias is required before uploading"))?;
-
-                return process_inp_upload(file_field, state, auth.clone(), alias).await;
-            }
-            Some(_) => {
-                // Ignore unknown fields.
-            }
-        }
                 let alias = alias
                     .clone()
                     .ok_or_else(|| AppError::bad_request("Alias is required before uploading"))?;
@@ -3475,7 +2891,6 @@ async fn upload(
     }
 
     Err(AppError::bad_request(
-        "Upload must include alias and .inp file",
         "Upload must include alias and .inp file",
     ))
 }
@@ -3491,8 +2906,6 @@ async fn cleanup_job_directory(path: &Path) {
 async fn process_inp_upload(
     mut field: Field<'_>,
     state: AppState,
-    auth: AuthUser,
-    alias: String,
     auth: AuthUser,
     alias: String,
 ) -> Result<Json<UploadResponse>, AppError> {
@@ -3583,76 +2996,12 @@ async fn process_inp_upload(
         );
     }
 
-    let estimator = CreditEstimator::default();
-    let estimate = match estimator
-        .estimate_from_input_file(&state.db_pool, &model_path)
-        .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            if let Err(clean_err) = fs::remove_dir_all(&job_dir).await {
-                if clean_err.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        "Failed to clean up job directory {} after estimate failure: {clean_err}",
-                        job_dir.display()
-                    );
-                }
-            }
-            return Err(err);
-        }
-    };
-
-    let estimated_credits = if estimate.estimated_credits.is_finite() {
-        estimate.estimated_credits.max(0.0)
-    } else {
-        0.0
-    };
-
-    let has_free_credits = auth.is_admin() || auth.has_unlimited_credits();
-    let charged_credits = if has_free_credits {
-        0.0
-    } else {
-        estimated_credits
-    };
-
-    if charged_credits > CREDIT_BALANCE_EPSILON {
-        match debit_user_credits(&state.db_pool, auth.user_id, charged_credits).await {
-            Ok(balance) => info!(
-                "User {} charged {:.3} credits for job {} (remaining {:.3})",
-                auth.user_id, charged_credits, job_id, balance
-            ),
-            Err(err) => {
-                if let Err(clean_err) = fs::remove_dir_all(&job_dir).await {
-                    if clean_err.kind() != std::io::ErrorKind::NotFound {
-                        warn!(
-                            "Failed to clean up job directory {} after credit failure: {clean_err}",
-                            job_dir.display()
-                        );
-                    }
-                }
-                return Err(err);
-            }
-        };
-    } else if auth.is_admin() {
-        info!(
-            "Admin user {} started job {} without credit deduction (estimate {:.3} credits)",
-            auth.user_id, job_id, estimated_credits
-        );
-    } else if auth.has_unlimited_credits() {
-        info!(
-            "User {} has unlimited credits; job {} not charged (estimate {:.3} credits)",
-            auth.user_id, job_id, estimated_credits
-        );
-    }
-
     let detected_job_type = detect_job_type(&model_path).await.unwrap_or(None);
 
     let cancel_token = CancellationToken::new();
 
     let job_entry = JobEntry {
         id: job_id,
-        owner_id: auth.user_id,
-        alias: alias.clone(),
         owner_id: auth.user_id,
         alias: alias.clone(),
         running: true,
@@ -3666,11 +3015,6 @@ async fn process_inp_upload(
         job_dir: job_dir.clone(),
         error: None,
         cancel_token: Some(cancel_token.clone()),
-        element_count: estimate.element_count,
-        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
-        benchmark_score: estimate.benchmark_score,
-        estimated_credits,
-        charged_credits,
         element_count: estimate.element_count,
         estimated_runtime_seconds: estimate.estimated_runtime_seconds,
         benchmark_score: estimate.benchmark_score,
@@ -3726,8 +3070,6 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
     // Run CalculiX and capture stdout/stderr into solver.log
     let execution = async {
         let mut completion_notification: Option<JobCompletionEmail> = None;
-    let execution = async {
-        let mut completion_notification: Option<JobCompletionEmail> = None;
         let log_file = std::fs::File::create(&log_path)?;
         let log_file_err = log_file.try_clone()?;
 
@@ -3765,7 +3107,6 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
 
         let mut jobs = state.jobs.write().await;
         let mut refund: Option<(i64, f64)> = None;
-        let mut refund: Option<(i64, f64)> = None;
         if let Some(entry) = jobs.get_mut(&job_id) {
             entry.running = false;
             entry.cancel_token = None;
@@ -3788,15 +3129,6 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
                     duration_seconds: entry.duration.unwrap_or_default(),
                     credits_used: entry.charged_credits,
                 });
-                completion_notification = Some(JobCompletionEmail {
-                    job_id,
-                    owner_id: entry.owner_id,
-                    alias: entry.alias.clone(),
-                    start_time: entry.started_at,
-                    end_time: Utc::now(),
-                    duration_seconds: entry.duration.unwrap_or_default(),
-                    credits_used: entry.charged_credits,
-                });
                 info!("CalculiX job {job_id} completed successfully");
             } else {
                 entry.done = true;
@@ -3807,17 +3139,9 @@ async fn run_calculix_job(state: AppState, job_id: Uuid, cancel_token: Cancellat
                     refund = Some((entry.owner_id, entry.charged_credits));
                     entry.charged_credits = 0.0;
                 }
-                if entry.charged_credits > CREDIT_BALANCE_EPSILON {
-                    refund = Some((entry.owner_id, entry.charged_credits));
-                    entry.charged_credits = 0.0;
-                }
             }
         }
 
-        Ok::<(Option<(i64, f64)>, Option<JobCompletionEmail>), anyhow::Error>((
-            refund,
-            completion_notification,
-        ))
         Ok::<(Option<(i64, f64)>, Option<JobCompletionEmail>), anyhow::Error>((
             refund,
             completion_notification,
@@ -3893,78 +3217,9 @@ async fn status(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<Vec<JobSummary>>, AppError> {
-    let mut completion_notification = None;
-
-    match execution {
-        Ok((refund, notification)) => {
-            completion_notification = notification;
-            if let Some((user_id, amount)) = refund {
-                if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await
-                {
-                    warn!(
-                        "Failed to refund credits for job {} (user {}): {:?}",
-                        job_id, user_id, refund_err
-                    );
-                } else {
-                    info!(
-                        "Refunded {:.3} credits to user {} after job {} failure",
-                        amount, user_id, job_id
-                    );
-                }
-            }
-        }
-        Err(err) => {
-            error!("CalculiX job {job_id} failed to run: {err:?}");
-            let mut jobs = state.jobs.write().await;
-            let mut refund: Option<(i64, f64)> = None;
-            if let Some(entry) = jobs.get_mut(&job_id) {
-                entry.running = false;
-                entry.done = true;
-                entry.duration = Some(entry.started_instant.elapsed().as_secs_f64());
-                entry.error = Some(err.to_string());
-                entry.cancel_token = None;
-                if entry.charged_credits > CREDIT_BALANCE_EPSILON {
-                    refund = Some((entry.owner_id, entry.charged_credits));
-                    entry.charged_credits = 0.0;
-                }
-            }
-            drop(jobs);
-
-            if let Some((user_id, amount)) = refund {
-                if let Err(refund_err) = credit_user_credits(&state.db_pool, user_id, amount).await
-                {
-                    warn!(
-                        "Failed to refund credits for job {} (user {}): {:?}",
-                        job_id, user_id, refund_err
-                    );
-                } else {
-                    info!(
-                        "Refunded {:.3} credits to user {} after job {} execution failure",
-                        amount, user_id, job_id
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some(notification) = completion_notification {
-        if let Err(err) = notify_job_completion(&state, notification).await {
-            warn!(
-                "Failed to send completion email for job {}: {}",
-                job_id, err.message
-            );
-        }
-    }
-}
-
-async fn status(
-    State(state): State<AppState>,
-    auth: AuthUser,
-) -> Result<Json<Vec<JobSummary>>, AppError> {
     let jobs = state.jobs.read().await;
     let mut summaries: Vec<JobSummary> = jobs
         .values()
-        .filter(|entry| auth.is_admin() || entry.owner_id == auth.user_id)
         .filter(|entry| auth.is_admin() || entry.owner_id == auth.user_id)
         .map(|entry| {
             let duration = if entry.running {
@@ -3977,8 +3232,6 @@ async fn status(
                 id: entry.id,
                 owner_id: entry.owner_id,
                 alias: entry.alias.clone(),
-                owner_id: entry.owner_id,
-                alias: entry.alias.clone(),
                 running: entry.running,
                 done: entry.done,
                 cancelled: entry.cancelled,
@@ -3986,11 +3239,6 @@ async fn status(
                 duration_seconds: duration,
                 job_type: entry.job_type.clone(),
                 error: entry.error.clone(),
-                element_count: entry.element_count,
-                estimated_runtime_seconds: entry.estimated_runtime_seconds,
-                benchmark_score: entry.benchmark_score,
-                estimated_credits: entry.estimated_credits,
-                charged_credits: entry.charged_credits,
                 element_count: entry.element_count,
                 estimated_runtime_seconds: entry.estimated_runtime_seconds,
                 benchmark_score: entry.benchmark_score,
@@ -4125,129 +3373,9 @@ async fn estimate_job_upload_preview(
     }))
 }
 
-async fn estimate_job_credits(
-    AxumPath(job_id): AxumPath<Uuid>,
-    State(state): State<AppState>,
-    auth: AuthUser,
-) -> Result<Json<JobEstimateResponse>, AppError> {
-    let job_entry = {
-        let jobs = state.jobs.read().await;
-        jobs.get(&job_id).cloned()
-    }
-    .ok_or_else(|| AppError::not_found("Job not found"))?;
-
-    if !auth.is_admin() && job_entry.owner_id != auth.user_id {
-        return Err(AppError::forbidden(
-            "You are not allowed to inspect this job",
-        ));
-    }
-
-    let mut estimate = JobCreditEstimate {
-        estimated_credits: job_entry.estimated_credits,
-        estimated_runtime_seconds: job_entry.estimated_runtime_seconds,
-        element_count: job_entry.element_count,
-        benchmark_score: job_entry.benchmark_score,
-    };
-
-    if estimate.element_count == 0 || !estimate.estimated_credits.is_finite() {
-        let estimator = CreditEstimator::default();
-        estimate = estimator.estimate_job_cost(&state, job_id).await?;
-    }
-
-    let charged_credits = if auth.is_admin() || auth.has_unlimited_credits() {
-        0.0
-    } else if estimate.estimated_credits.is_finite() {
-        estimate.estimated_credits.max(0.0)
-    } else {
-        0.0
-    };
-
-    Ok(Json(JobEstimateResponse {
-        job_id,
-        estimated_credits: estimate.estimated_credits,
-        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
-        element_count: estimate.element_count,
-        benchmark_score: estimate.benchmark_score,
-        charged_credits,
-    }))
-}
-
-async fn estimate_job_upload_preview(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    mut multipart: Multipart,
-) -> Result<Json<JobEstimatePreviewResponse>, AppError> {
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut received_file = false;
-
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| AppError::internal(err.to_string()))?
-    {
-        let name = field.name().map(|name| name.to_string());
-        match name.as_deref() {
-            Some("alias") => {
-                // Alias is optional for estimation; ignore value.
-                let _ = field.text().await;
-            }
-            Some("file") | None => {
-                received_file = true;
-                while let Some(chunk) = field.chunk().await.map_err(|err| {
-                    AppError::internal(format!("Failed to read upload chunk: {err}"))
-                })? {
-                    buffer.extend_from_slice(&chunk);
-                }
-            }
-            Some(_) => {
-                // Ignore any other fields.
-            }
-        }
-    }
-
-    if !received_file {
-        return Err(AppError::bad_request(
-            "Request must include a CalculiX .inp file for estimation",
-        ));
-    }
-
-    if buffer.is_empty() {
-        return Err(AppError::bad_request("Uploaded file is empty"));
-    }
-
-    let contents = String::from_utf8(buffer)
-        .map_err(|_| AppError::bad_request("Input file must be UTF-8 encoded text"))?;
-
-    let estimator = CreditEstimator::default();
-    let estimate = estimator
-        .estimate_from_contents(&state.db_pool, &contents)
-        .await?;
-
-    let estimated_credits = if estimate.estimated_credits.is_finite() {
-        estimate.estimated_credits.max(0.0)
-    } else {
-        0.0
-    };
-
-    let charged_credits = if auth.is_admin() || auth.has_unlimited_credits() {
-        0.0
-    } else {
-        estimated_credits
-    };
-
-    Ok(Json(JobEstimatePreviewResponse {
-        estimated_credits,
-        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
-        element_count: estimate.element_count,
-        benchmark_score: estimate.benchmark_score,
-        charged_credits,
-    }))
-}
-
 async fn cancel_job(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
-    auth: AuthUser,
     auth: AuthUser,
 ) -> Result<StatusCode, AppError> {
     let cancel_token = {
@@ -4255,12 +3383,6 @@ async fn cancel_job(
         let entry = jobs
             .get_mut(&job_id)
             .ok_or_else(|| AppError::not_found("Job not found"))?;
-
-        if !auth.is_admin() && entry.owner_id != auth.user_id {
-            return Err(AppError::forbidden(
-                "You are not allowed to cancel this job",
-            ));
-        }
 
         if !auth.is_admin() && entry.owner_id != auth.user_id {
             return Err(AppError::forbidden(
@@ -4286,19 +3408,12 @@ async fn delete_job(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
     auth: AuthUser,
-    auth: AuthUser,
 ) -> Result<StatusCode, AppError> {
     let job_dir = {
         let mut jobs = state.jobs.write().await;
         let entry = jobs
             .get(&job_id)
             .ok_or_else(|| AppError::not_found("Job not found"))?;
-
-        if !auth.is_admin() && entry.owner_id != auth.user_id {
-            return Err(AppError::forbidden(
-                "You are not allowed to delete this job",
-            ));
-        }
 
         if !auth.is_admin() && entry.owner_id != auth.user_id {
             return Err(AppError::forbidden(
@@ -4334,7 +3449,6 @@ async fn download(
     AxumPath(job_id): AxumPath<Uuid>,
     State(state): State<AppState>,
     auth: AuthUser,
-    auth: AuthUser,
 ) -> Result<Response, AppError> {
     let job = {
         let jobs = state.jobs.read().await;
@@ -4342,12 +3456,6 @@ async fn download(
     };
 
     let job = job.ok_or_else(|| AppError::not_found("Job not found"))?;
-
-    if !auth.is_admin() && job.owner_id != auth.user_id {
-        return Err(AppError::forbidden(
-            "You are not allowed to download this job",
-        ));
-    }
 
     if !auth.is_admin() && job.owner_id != auth.user_id {
         return Err(AppError::forbidden(

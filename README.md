@@ -1,5 +1,11 @@
 # ⚙️ CalculiX Server
+# ⚙️ CalculiX Server
 
+A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](https://www.calculix.de) FEM simulations — powered by a **Rust backend** and **SvelteKit frontend**.
+
+![CalculiX Server Screenshot](./interface.jpeg)
+
+---
 A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](https://www.calculix.de) FEM simulations — powered by a **Rust backend** and **SvelteKit frontend**.
 
 ![CalculiX Server Screenshot](./interface.jpeg)
@@ -79,17 +85,37 @@ You can optionally retag it for convenience:
 
 ```bash
 docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
+docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
 ```
 
 ---
 
 ## ⚙️ Configuration
+---
 
+## ⚙️ Configuration
+
+All configuration is handled via **environment variables**:
 All configuration is handled via **environment variables**:
 
 | Variable | Default | Description |
 |-----------|----------|-------------|
+| Variable | Default | Description |
+|-----------|----------|-------------|
 | `APP_ADDR` | `0.0.0.0:8080` | Bind address for the HTTP server. |
+| `CCX_THREADS` | `8` | Threads passed to `ccx -nt`. |
+| `UPLOAD_LIMIT_GB` | `1` | Maximum upload size (in GiB). |
+| `DATA_ROOT` | `/data` | Root directory for job storage. |
+| `FRONTEND_DIST` | `/app/frontend` | Internal path to built Svelte assets. |
+
+> 💡 If `UPLOAD_LIMIT_GB` is too small or zero, the server refuses to start and prints a clear error message.
+
+Mail delivery (SMTP) and the public base URL used in notification links are configured from the admin dashboard under **Mail Settings**.
+
+---
+
+## 📂 Directory Layout
+
 | `CCX_THREADS` | `8` | Threads passed to `ccx -nt`. |
 | `UPLOAD_LIMIT_GB` | `1` | Maximum upload size (in GiB). |
 | `DATA_ROOT` | `/data` | Root directory for job storage. |
@@ -112,8 +138,12 @@ Mail delivery (SMTP) and the public base URL used in notification links are conf
       *.frd
       *.dat
       other CalculiX outputs
+      *.frd
+      *.dat
+      other CalculiX outputs
 ```
 
+Mount your host’s `./data` folder into `/data` to persist results between runs.
 Mount your host’s `./data` folder into `/data` to persist results between runs.
 
 ---
@@ -123,7 +153,15 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
 ### 🪄 Option 1 — Using Docker Compose (recommended)
 
 1. **Create a working folder**
+---
+
+## 🧭 Quick Start
+
+### 🪄 Option 1 — Using Docker Compose (recommended)
+
+1. **Create a working folder**
    ```bash
+   mkdir calculix-server && cd calculix-server
    mkdir calculix-server && cd calculix-server
    ```
 
@@ -142,9 +180,41 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
    ```
 
 3. **Start it:**
+2. **Create a simple `docker-compose.yml`:**
+   ```yaml
+   services:
+     calculix-server:
+       image: lukasneo/calculix-server:v1.3
+       ports:
+         - "8080:8080"
+       environment:
+         - CCX_THREADS=8
+         - UPLOAD_LIMIT_GB=2
+       volumes:
+         - ./data:/data
+   ```
+
+3. **Start it:**
    ```bash
    docker compose up -d
    ```
+
+4. **Open the web UI:**
+   ```
+   http://localhost:8080
+   ```
+
+5. **Login:**  
+   Default credentials →  
+   **Email:** `admin@mail.com`  
+   **Password:** `admin`
+
+---
+
+### 🧩 Option 2 — Manual Docker Command
+
+If you don’t use Compose:
+
 
 4. **Open the web UI:**
    ```

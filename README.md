@@ -72,14 +72,13 @@ Each job runs inside a secure Docker container with configurable thread and uplo
 A prebuilt image is available for `linux/amd64` on Docker Hub:
 
 ```bash
-docker pull lukasneo/calculix-server:v1.3
+docker pull lukasneo/calculix-server:v1.4
 ```
 
 You can optionally retag it for convenience:
 
 ```bash
-docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
-docker tag lukasneo/calculix-server:v1.3 calculix-server:latest
+docker tag lukasneo/calculix-server:v1.4 calculix-server:latest
 ```
 
 ---
@@ -151,7 +150,7 @@ Mount your host’s `./data` folder into `/data` to persist results between runs
    ```yaml
    services:
      calculix-server:
-       image: lukasneo/calculix-server:v1.3
+       image: lukasneo/calculix-server:v1.4
        ports:
          - "8080:8080"
        environment:
@@ -186,7 +185,7 @@ docker run --rm \
   -e CCX_THREADS=8 \
   -e UPLOAD_LIMIT_GB=2 \
   -v "$(pwd)/data:/data" \
-  lukasneo/calculix-server:v1.3
+  lukasneo/calculix-server:v1.4
 ```
 
 ---

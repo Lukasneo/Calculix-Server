@@ -274,6 +274,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
  "zip",
 ]
 

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    io::ErrorKind,
+    io::{Cursor, ErrorKind},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -11,8 +11,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::multipart::Field;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{multipart::Field, DefaultBodyLimit, Query};
 use axum::{
     async_trait,
     body::{Body, Bytes},
@@ -51,7 +50,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
-use zip::write::FileOptions;
+use walkdir::WalkDir;
+use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
 #[derive(Clone)]
 struct AppState {
@@ -67,6 +67,7 @@ struct AppState {
     email_templates: EmailTemplateEngine,
     mail_log_path: Arc<PathBuf>,
     mail_base_url: Arc<RwLock<Option<String>>>,
+    max_upload_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -633,6 +634,18 @@ struct UserResponse {
 }
 
 #[derive(Serialize)]
+struct AuthUserSummary {
+    id: i64,
+    email: String,
+}
+
+#[derive(Serialize)]
+struct AuthLoginResponse {
+    access_token: String,
+    user: AuthUserSummary,
+}
+
+#[derive(Serialize)]
 struct ProfileResponse {
     id: i64,
     email: String,
@@ -774,6 +787,15 @@ struct JobEstimateResponse {
 }
 
 #[derive(Serialize)]
+struct JobStatusResponse {
+    alias: String,
+    status: String,
+    progress: f64,
+    started_at: String,
+    estimated_time_s: f64,
+}
+
+#[derive(Serialize)]
 struct UserCreditsResponse {
     id: i64,
     email: String,
@@ -788,6 +810,19 @@ struct JobEstimatePreviewResponse {
     element_count: usize,
     benchmark_score: f64,
     charged_credits: f64,
+}
+
+#[derive(Serialize)]
+struct SimulationSendResponse {
+    alias: String,
+    estimated_credits: f64,
+    estimated_time_s: f64,
+}
+
+#[derive(Serialize)]
+struct SimulationStartResponse {
+    status: String,
+    alias: String,
 }
 
 #[derive(Deserialize)]
@@ -909,6 +944,11 @@ struct SimulationUpdatePayload {
     alias: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SimulationStartPayload {
+    alias: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AuthClaims {
     sub: i64,
@@ -933,6 +973,46 @@ impl AuthUser {
     }
 }
 
+fn extract_bearer_token(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let token = trimmed.strip_prefix("Bearer ")?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+async fn authenticate_token(state: &AppState, token: &str) -> Result<AuthUser, AppError> {
+    let token_data = decode::<AuthClaims>(
+        token,
+        state.jwt_decoding_key.as_ref(),
+        &Validation::default(),
+    )
+    .map_err(|_| AppError::unauthorized("Invalid or expired authentication token"))?;
+
+    let user_record = fetch_user_by_id(&state.db_pool, token_data.claims.sub).await?;
+    if !user_record.active {
+        return Err(AppError::forbidden("Account deactivated"));
+    }
+
+    let role = UserRole::from_db(&user_record.role)?;
+
+    Ok(AuthUser {
+        user_id: user_record.id,
+        role,
+        unlimited: user_record.unlimited,
+    })
+}
+
+fn current_user<B>(req: &Request<B>) -> Result<AuthUser, AppError> {
+    req.extensions()
+        .get::<AuthUser>()
+        .cloned()
+        .ok_or_else(|| AppError::unauthorized("Authentication required"))
+}
+
 async fn handle_auth_middleware(
     req: Request<Body>,
     next: Next,
@@ -950,6 +1030,30 @@ async fn handle_auth_middleware(
     request.extensions_mut().insert(auth);
 
     Ok(next.run(request).await)
+}
+
+async fn require_bearer_auth(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let header_value = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .ok_or_else(|| AppError::unauthorized("Authorization header is required"))?;
+
+    let header_str = header_value
+        .to_str()
+        .map_err(|_| AppError::unauthorized("Invalid Authorization header"))?;
+
+    let token = extract_bearer_token(header_str)
+        .ok_or_else(|| AppError::unauthorized("Invalid Authorization header"))?;
+
+    let auth_user = authenticate_token(&state, token).await?;
+    req.extensions_mut().insert(auth_user);
+    let _ = current_user(&req)?;
+
+    Ok(next.run(req).await)
 }
 
 async fn require_auth(
@@ -1024,6 +1128,18 @@ where
             return Ok(existing.clone());
         }
 
+        if let Some(header_value) = parts.headers.get(header::AUTHORIZATION) {
+            let header_str = header_value
+                .to_str()
+                .map_err(|_| AppError::unauthorized("Invalid Authorization header"))?;
+
+            let token = extract_bearer_token(header_str)
+                .ok_or_else(|| AppError::unauthorized("Invalid Authorization header"))?;
+
+            let app_state = AppState::from_ref(state);
+            return authenticate_token(&app_state, token).await;
+        }
+
         let jar = CookieJar::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::unauthorized("Failed to read authentication cookie"))?;
@@ -1035,26 +1151,7 @@ where
         let app_state = AppState::from_ref(state);
 
         let token = cookie.value();
-        let token_data = decode::<AuthClaims>(
-            token,
-            app_state.jwt_decoding_key.as_ref(),
-            &Validation::default(),
-        )
-        .map_err(|_| AppError::unauthorized("Invalid or expired authentication token"))?;
-
-        let app_state = AppState::from_ref(state);
-        let user_record = fetch_user_by_id(&app_state.db_pool, token_data.claims.sub).await?;
-        if !user_record.active {
-            return Err(AppError::forbidden("Account deactivated"));
-        }
-
-        let role = UserRole::from_db(&user_record.role)?;
-
-        Ok(AuthUser {
-            user_id: user_record.id,
-            role,
-            unlimited: user_record.unlimited,
-        })
+        authenticate_token(&app_state, token).await
     }
 }
 
@@ -1359,12 +1456,16 @@ async fn credit_user_credits(
         .ok_or_else(|| AppError::not_found("User not found"))
 }
 
-fn core_api_router() -> Router<AppState> {
+fn auth_routes() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+}
+
+fn simulations_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/simulations",
             get(list_simulations).post(create_simulation),
@@ -1373,6 +1474,12 @@ fn core_api_router() -> Router<AppState> {
             "/simulations/:id",
             patch(update_simulation).delete(delete_simulation),
         )
+        .route("/simulations/send", post(send_simulation))
+        .route("/simulations/start", post(start_simulation))
+}
+
+fn core_api_router() -> Router<AppState> {
+    auth_routes().merge(simulations_routes())
 }
 
 #[tokio::main]
@@ -1516,6 +1623,7 @@ async fn main() -> Result<()> {
         email_templates,
         mail_log_path: Arc::new(mail_log_path),
         mail_base_url: Arc::new(RwLock::new(mail_base_url)),
+        max_upload_bytes,
     };
 
     let upload_router = Router::new()
@@ -1556,17 +1664,27 @@ async fn main() -> Result<()> {
 
     let public_settings_router = Router::new().route("/", get(public_settings));
 
-    let api_router = core_api_router()
+    let simulations_router = simulations_routes()
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
+        .route_layer(from_fn_with_state(state.clone(), require_bearer_auth));
+
+    let api_router = Router::new()
+        .route("/auth/login", post(api_login))
+        .merge(auth_routes())
+        .merge(simulations_router)
         .nest("/profile", profile_router)
         .nest("/admin", admin_router)
         .nest("/settings", public_settings_router)
+        .route("/simulations/status", get(get_simulation_status))
+        .route("/simulations/list", get(list_simulations))
+        .route("/simulations/load", get(get_simulation_load))
         .merge(
             Router::new()
                 .route("/jobs/:id/estimate", get(estimate_job_credits))
                 .route_layer(from_fn_with_state(state.clone(), require_auth)),
         );
 
-    let legacy_router = core_api_router();
+    let legacy_router = core_api_router().layer(DefaultBodyLimit::max(max_upload_bytes));
 
     let static_service = ServeDir::new(frontend_dir.clone())
         .not_found_service(ServeFile::new(frontend_dir.join("index.html")));
@@ -1660,6 +1778,32 @@ async fn register(
     Ok((jar, Json(user_response)))
 }
 
+async fn authenticate_user(
+    state: &AppState,
+    email: &str,
+    password: &str,
+    failure_message: &'static str,
+) -> Result<(UserRecord, UserRole), AppError> {
+    let user_record = fetch_user_by_email(&state.db_pool, email)
+        .await?
+        .ok_or_else(|| AppError::unauthorized(failure_message))?;
+
+    if !user_record.active {
+        return Err(AppError::forbidden("Account deactivated"));
+    }
+
+    let parsed_hash = PasswordHash::new(&user_record.password_hash)
+        .map_err(|err| AppError::internal(format!("Invalid stored password hash: {err}")))?;
+
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .map_err(|_| AppError::unauthorized(failure_message))?;
+
+    let role = UserRole::from_db(&user_record.role)?;
+
+    Ok((user_record, role))
+}
+
 async fn login(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1675,28 +1819,45 @@ async fn login(
         return Err(AppError::bad_request("Email is required"));
     }
 
-    let user_record = fetch_user_by_email(&state.db_pool, &email)
-        .await?
-        .ok_or_else(|| AppError::unauthorized("Invalid email or password"))?;
+    let (user_record, role) =
+        authenticate_user(&state, &email, &password, "Invalid email or password").await?;
 
-    if !user_record.active {
-        return Err(AppError::forbidden("Account deactivated"));
-    }
-
-    let parsed_hash = PasswordHash::new(&user_record.password_hash)
-        .map_err(|err| AppError::internal(format!("Invalid stored password hash: {err}")))?;
-
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .map_err(|_| AppError::unauthorized("Invalid email or password"))?;
-
-    let role = UserRole::from_db(&user_record.role)?;
     let (token, expires) = create_jwt(&state, user_record.id, role)?;
     let cookie = build_auth_cookie(token, expires);
     let jar = jar.add(cookie);
 
     let user_response = user_record.into_response()?;
     Ok((jar, Json(user_response)))
+}
+
+async fn api_login(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginPayload>,
+) -> Result<Json<AuthLoginResponse>, AppError> {
+    let LoginPayload {
+        email: raw_email,
+        password,
+    } = payload;
+
+    let email = normalize_email(&raw_email);
+    if email.is_empty() || password.is_empty() {
+        return Err(AppError::unauthorized("Invalid credentials"));
+    }
+
+    let (user_record, role) =
+        authenticate_user(&state, &email, &password, "Invalid credentials").await?;
+
+    let (token, _) = create_jwt(&state, user_record.id, role)?;
+
+    let response = AuthLoginResponse {
+        access_token: token,
+        user: AuthUserSummary {
+            id: user_record.id,
+            email: user_record.email,
+        },
+    };
+
+    Ok(Json(response))
 }
 
 async fn logout(jar: CookieJar) -> Result<(CookieJar, StatusCode), AppError> {
@@ -2339,6 +2500,349 @@ async fn update_simulation(
     Ok(Json(updated.into_response()?))
 }
 
+async fn send_simulation(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    mut multipart: Multipart,
+) -> Result<Json<SimulationSendResponse>, AppError> {
+    let mut alias_raw: Option<String> = None;
+    let mut alias_fallback: Option<String> = None;
+    let mut file_saved = false;
+    let mut total_bytes: usize = 0;
+    let mut job_id: Option<Uuid> = None;
+    let mut job_dir: Option<PathBuf> = None;
+    let mut model_path: Option<PathBuf> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?
+    {
+        let field_name = field.name().map(|value| value.to_string());
+        match field_name.as_deref() {
+            Some("alias") => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|err| AppError::internal(format!("Failed to read alias: {err}")))?;
+                alias_raw = Some(value);
+            }
+            Some("file") | None => {
+                if file_saved {
+                    return Err(AppError::bad_request(
+                        "Multiple files provided; only one .inp file is allowed",
+                    ));
+                }
+
+                let file_name =
+                    field
+                        .file_name()
+                        .map(|name| name.to_string())
+                        .ok_or_else(|| {
+                            AppError::bad_request("Uploaded file must include a filename")
+                        })?;
+
+                if !file_name.to_ascii_lowercase().ends_with(".inp") {
+                    return Err(AppError::bad_request("Only .inp files are accepted"));
+                }
+
+                if let Some(raw_alias) = Path::new(&file_name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    match normalize_alias_optional(Some(raw_alias.as_str())) {
+                        Ok(sanitized) => {
+                            alias_fallback = sanitized;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Discarding derived alias \"{}\" due to validation error: {}",
+                                raw_alias, err.message
+                            );
+                            alias_fallback = None;
+                        }
+                    }
+                }
+
+                let current_job_id = job_id.get_or_insert_with(Uuid::new_v4).to_owned();
+                let dir = match job_dir.clone() {
+                    Some(dir) => dir,
+                    None => {
+                        let dir = state.jobs_dir.join(current_job_id.to_string());
+                        fs::create_dir_all(&dir).await.map_err(|err| {
+                            AppError::internal(format!("Failed to create job directory: {err}"))
+                        })?;
+                        job_dir = Some(dir.clone());
+                        dir
+                    }
+                };
+
+                let path = dir.join("model.inp");
+                let mut file = fs::File::create(&path).await.map_err(|err| {
+                    AppError::internal(format!("Failed to create model.inp: {err}"))
+                })?;
+
+                while let Some(chunk) = field.chunk().await.map_err(|err| {
+                    AppError::internal(format!("Failed to read upload chunk: {err}"))
+                })? {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    if total_bytes > state.max_upload_bytes {
+                        drop(file);
+                        if let Some(dir) = job_dir.as_ref() {
+                            cleanup_job_directory(dir).await;
+                        }
+                        return Err(AppError::bad_request(
+                            "Uploaded file exceeds maximum allowed size",
+                        ));
+                    }
+                    file.write_all(&chunk).await.map_err(|err| {
+                        AppError::internal(format!("Failed writing model.inp: {err}"))
+                    })?;
+                }
+
+                if total_bytes == 0 {
+                    drop(file);
+                    if let Some(dir) = job_dir.as_ref() {
+                        cleanup_job_directory(dir).await;
+                    }
+                    return Err(AppError::bad_request("Uploaded file is empty"));
+                }
+
+                file.flush().await.map_err(|err| {
+                    AppError::internal(format!("Failed to flush model.inp: {err}"))
+                })?;
+
+                model_path = Some(path);
+                file_saved = true;
+            }
+            Some(_) => {
+                // Ignore unknown fields.
+            }
+        }
+    }
+
+    if !file_saved {
+        return Err(AppError::bad_request(
+            "Request must include a CalculiX .inp file",
+        ));
+    }
+
+    let job_id = job_id.expect("job id set when file is saved");
+    let job_dir = job_dir.expect("job dir set when file is saved");
+    let model_path = model_path.expect("model path set when file is saved");
+
+    let alias_optional = match normalize_alias_optional(alias_raw.as_deref()) {
+        Ok(value) => value,
+        Err(err) => {
+            cleanup_job_directory(&job_dir).await;
+            return Err(err);
+        }
+    };
+
+    let estimator = CreditEstimator::default();
+    let estimate = match estimator
+        .estimate_from_input_file(&state.db_pool, &model_path)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            cleanup_job_directory(&job_dir).await;
+            return Err(err);
+        }
+    };
+
+    let estimated_credits = if estimate.estimated_credits.is_finite() {
+        estimate.estimated_credits.max(0.0)
+    } else {
+        0.0
+    };
+
+    if estimated_credits > 0.0 && !auth.is_admin() && !auth.has_unlimited_credits() {
+        let user_record = match fetch_user_by_id(&state.db_pool, auth.user_id).await {
+            Ok(record) => record,
+            Err(err) => {
+                cleanup_job_directory(&job_dir).await;
+                return Err(err);
+            }
+        };
+
+        if user_record.credits + CREDIT_BALANCE_EPSILON < estimated_credits {
+            cleanup_job_directory(&job_dir).await;
+            return Err(AppError::payment_required(
+                "Not enough credits to start simulation",
+            ));
+        }
+    }
+
+    let alias_for_db = alias_optional.clone().or_else(|| alias_fallback.clone());
+    let timestamp = Utc::now().timestamp();
+
+    let insert_result = query(
+        "INSERT INTO simulations (owner_id, status, alias, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(auth.user_id)
+    .bind(DEFAULT_SIM_STATUS)
+    .bind(alias_for_db.clone())
+    .bind(timestamp)
+    .bind(timestamp)
+    .execute(&state.db_pool)
+    .await;
+
+    if let Err(err) = insert_result {
+        cleanup_job_directory(&job_dir).await;
+        return Err(AppError::internal(format!(
+            "Failed to create simulation: {err}"
+        )));
+    }
+
+    let detected_job_type = detect_job_type(&model_path).await.unwrap_or(None);
+
+    let alias_response = alias_for_db.clone().unwrap_or_else(|| job_id.to_string());
+
+    let job_entry = JobEntry {
+        id: job_id,
+        owner_id: auth.user_id,
+        alias: alias_response.clone(),
+        running: false,
+        done: false,
+        cancelled: false,
+        started_at: Utc::now(),
+        started_instant: Instant::now(),
+        duration: None,
+        job_type: detected_job_type,
+        log_path: job_dir.join("solver.log"),
+        job_dir: job_dir.clone(),
+        error: None,
+        cancel_token: None,
+        element_count: estimate.element_count,
+        estimated_runtime_seconds: estimate.estimated_runtime_seconds,
+        benchmark_score: estimate.benchmark_score,
+        estimated_credits,
+        charged_credits: 0.0,
+    };
+
+    {
+        let mut jobs = state.jobs.write().await;
+        jobs.insert(job_id, job_entry);
+    }
+
+    let response = SimulationSendResponse {
+        alias: alias_response,
+        estimated_credits,
+        estimated_time_s: estimate.estimated_runtime_seconds,
+    };
+
+    Ok(Json(response))
+}
+
+async fn start_simulation(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<SimulationStartPayload>,
+) -> Result<Json<SimulationStartResponse>, AppError> {
+    let SimulationStartPayload { alias } = payload;
+    let normalized_alias = normalize_alias_required(&alias)?;
+
+    let pending_job = {
+        let jobs = state.jobs.read().await;
+        jobs.iter()
+            .find(|(_, entry)| {
+                entry.owner_id == auth.user_id
+                    && !entry.running
+                    && !entry.done
+                    && entry.alias == normalized_alias
+            })
+            .map(|(job_id, entry)| (*job_id, entry.clone()))
+    };
+
+    let (job_id, job_snapshot) =
+        pending_job.ok_or_else(|| AppError::not_found("Pending simulation not found"))?;
+
+    if job_snapshot.charged_credits > CREDIT_BALANCE_EPSILON {
+        return Err(AppError::bad_request(
+            "Simulation has already been charged for execution",
+        ));
+    }
+
+    let model_path = job_snapshot.job_dir.join("model.inp");
+    fs::metadata(&model_path)
+        .await
+        .map_err(|_| AppError::internal("Simulation input file missing"))?;
+
+    let requires_charge = !(auth.is_admin() || auth.has_unlimited_credits());
+    let mut charged_credits = 0.0;
+
+    if requires_charge && job_snapshot.estimated_credits.is_finite() {
+        let amount = job_snapshot.estimated_credits.max(0.0);
+        if amount > CREDIT_BALANCE_EPSILON {
+            debit_user_credits(&state.db_pool, auth.user_id, amount).await?;
+            charged_credits = amount;
+        }
+    }
+
+    let cancel_token = CancellationToken::new();
+    let job_start_result = {
+        let mut jobs = state.jobs.write().await;
+        match jobs.get_mut(&job_id) {
+            Some(entry) => {
+                if entry.owner_id != auth.user_id || entry.alias != normalized_alias {
+                    Err(AppError::not_found("Pending simulation not found"))
+                } else if entry.running {
+                    Err(AppError::bad_request("Simulation is already running"))
+                } else if entry.done {
+                    Err(AppError::bad_request("Simulation has already completed"))
+                } else {
+                    entry.running = true;
+                    entry.done = false;
+                    entry.cancelled = false;
+                    entry.started_at = Utc::now();
+                    entry.started_instant = Instant::now();
+                    entry.duration = None;
+                    entry.error = None;
+                    entry.charged_credits = charged_credits;
+                    entry.cancel_token = Some(cancel_token.clone());
+                    Ok(entry.alias.clone())
+                }
+            }
+            None => Err(AppError::not_found("Pending simulation not found")),
+        }
+    };
+
+    let alias_for_response = match job_start_result {
+        Ok(value) => value,
+        Err(err) => {
+            if charged_credits > CREDIT_BALANCE_EPSILON {
+                if let Err(refund_err) =
+                    credit_user_credits(&state.db_pool, auth.user_id, charged_credits).await
+                {
+                    warn!(
+                        "Failed to refund credits after simulation start error for user {}: {:?}",
+                        auth.user_id, refund_err
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    info!(
+        "User {} started simulation \"{}\" (job {}) using {:.3} credits",
+        auth.user_id, alias_for_response, job_id, charged_credits
+    );
+
+    tokio::spawn(run_calculix_job(state.clone(), job_id, cancel_token));
+
+    Ok(Json(SimulationStartResponse {
+        status: "started".to_string(),
+        alias: alias_for_response,
+    }))
+}
+
 async fn upload(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -2389,6 +2893,14 @@ async fn upload(
     Err(AppError::bad_request(
         "Upload must include alias and .inp file",
     ))
+}
+
+async fn cleanup_job_directory(path: &Path) {
+    if let Err(err) = fs::remove_dir_all(path).await {
+        if err.kind() != ErrorKind::NotFound {
+            warn!("Failed to clean up job directory {}: {err}", path.display());
+        }
+    }
 }
 
 async fn process_inp_upload(
@@ -2971,24 +3483,104 @@ async fn download(
     Ok((headers, body).into_response())
 }
 
-fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    {
-        let mut writer = zip::ZipWriter::new(&mut cursor);
-        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for entry in std::fs::read_dir(job_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                writer.start_file(file_name, options)?;
-                let mut file = std::fs::File::open(&path)?;
-                std::io::copy(&mut file, &mut writer)?;
-            }
-        }
-        writer.finish()?;
+async fn get_simulation_load(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let alias = params
+        .get("alias")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("Alias parameter is required"))?;
+
+    let jobs = state.jobs.read().await;
+
+    let job = jobs
+        .values()
+        .find(|job| job.owner_id == auth.user_id && job.alias == *alias)
+        .cloned()
+        .ok_or_else(|| AppError::not_found("Job Not Found"))?;
+
+    if job.owner_id != auth.user_id {
+        return Err(AppError::forbidden("Forbidden"));
     }
 
+    drop(jobs);
+
+    if !job.done {
+        return Err(AppError::bad_request("Job is not finished yet"));
+    }
+
+    let zip_bytes = tokio::task::spawn_blocking(move || create_results_archive(&job.job_dir))
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to join archive task: {e}")))?
+        .map_err(|e| AppError::internal(format!("Failed to create archive: {e}")))?;
+
+    let filename = format!("{}.zip", job.alias);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/zip".parse().unwrap());
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{}\"", filename)
+            .parse()
+            .unwrap(),
+    );
+
+    let body = Bytes::from(zip_bytes);
+    info!(
+        "User {} downloaded ZIP archive for job {}",
+        auth.user_id, job.id
+    );
+
+    Ok((headers, body).into_response())
+}
+
+fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(cursor);
+    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    for entry in WalkDir::new(job_dir) {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to read contents while creating archive for {}",
+                job_dir.display()
+            )
+        })?;
+
+        let path = entry.path();
+        let relative = path.strip_prefix(job_dir).with_context(|| {
+            format!(
+                "Failed to derive relative path for {} within {}",
+                path.display(),
+                job_dir.display()
+            )
+        })?;
+
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let name = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if entry.file_type().is_dir() {
+            zip.add_directory(name, options)?;
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            zip.start_file(name, options)?;
+            let mut file = std::fs::File::open(path)?;
+            std::io::copy(&mut file, &mut zip)?;
+        }
+    }
+
+    let cursor = zip.finish()?;
     Ok(cursor.into_inner())
 }
 
@@ -3011,6 +3603,96 @@ fn resolve_upload_limit_bytes() -> Result<usize> {
     }
 
     Ok(bytes as usize)
+}
+
+async fn get_simulation_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<JobStatusResponse>, AppError> {
+    let alias = params
+        .get("alias")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("Alias parameter is required"))?;
+
+    let jobs = state.jobs.read().await;
+
+    let job = jobs
+        .values()
+        .find(|job| job.owner_id == auth.user_id && job.alias == *alias)
+        .cloned()
+        .ok_or_else(|| AppError::not_found("Job Not Found"))?;
+
+    if job.owner_id != auth.user_id {
+        return Err(AppError::forbidden("Forbidden"));
+    }
+
+    let status = if job.running {
+        "running".to_string()
+    } else if job.done {
+        "finished".to_string()
+    } else if job.cancelled {
+        "cancelled".to_string()
+    } else {
+        "pending".to_string()
+    };
+
+    let progress = if job.done {
+        1.0
+    } else {
+        calculate_progress_from_log(&job.log_path)
+            .await
+            .unwrap_or(0.0)
+    };
+
+    Ok(Json(JobStatusResponse {
+        alias: job.alias.clone(),
+        status,
+        progress,
+        started_at: job.started_at.to_rfc3339(),
+        estimated_time_s: job.estimated_runtime_seconds,
+    }))
+}
+
+async fn calculate_progress_from_log(log_path: &Path) -> Result<f64, AppError> {
+    let content = match fs::read_to_string(log_path).await {
+        Ok(content) => content,
+        Err(_) => return Ok(0.0),
+    };
+
+    let mut max_line = 0.0;
+
+    for line in content.lines() {
+        if line.contains("PERCENT COMPLETE") {
+            let parts: Vec<&str> = line.split("PERCENT COMPLETE").collect();
+
+            if parts.len() > 1 {
+                let number_str = parts[0].trim();
+
+                match number_str.parse::<f64>() {
+                    Ok(number) => {
+                        if number > max_line {
+                            max_line = number;
+                        }
+                    }
+                    Err(_) => {
+                        println!("Failed to parse number from line: {}", line);
+                    }
+                }
+            }
+        }
+    }
+
+    if max_line > 0.0 {
+        if max_line > 100.0 {
+            return Ok(1.0);
+        } else {
+            return Ok(max_line / 100.0);
+        }
+    } else {
+        return Ok(0.0);
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,0 @@
-{
-  "host": "smtp.purelymail.com",
-  "port": 465,
-  "username": "noreplay@neofuse3d.com",
-  "password": "fysma0-jekkej-fiDsyr",
-  "from_address": "noreplay@neofuse3d.com",
-  "use_tls": true
-}

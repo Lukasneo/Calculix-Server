@@ -17,6 +17,7 @@ A self-contained, Dockerized web interface for running [**CalculiX (ccx)**](http
   - [Option 1 — Docker Compose](#-option-1--using-docker-compose-recommended)
   - [Option 2 — Manual Docker Run](#-option-2--manual-docker-command)
 - [Development](#-development)
+- [HTTP API](#-http-api)
 - [License](#-license)
 - [Acknowledgment](#-acknowledgment)
 
@@ -182,6 +183,70 @@ For local development (non-Docker):
 | Frontend | `cd frontend && npm run dev` |
 
 The Dockerfile builds both parts in release mode and packages them into a small Debian runtime image containing CalculiX.
+
+---
+
+## 🌐 HTTP API
+
+The server exposes a simple JSON/HTTP API for automating uploads, kicking off runs, checking status, and downloading results.
+
+Authentication
+- Issue token: `POST /api/auth/login`
+  - Body: `{ "email": "user@mail.com", "password": "..." }`
+  - Response: `{ "access_token": "<jwt>", "user": { "id": 1, "email": "user@mail.com" } }`
+- Send the token on all protected routes as `Authorization: Bearer <jwt>`.
+
+Common error shape
+- Non‑2xx responses return `{ "error": "..." }` with appropriate HTTP status (e.g. 400, 401, 402, 403, 404).
+
+Simulations
+- Send (stage) a simulation: `POST /api/simulations/send`
+  - Content‑Type: `multipart/form-data`
+  - Fields:
+    - `file`: `.inp` file (required)
+    - `alias`: string (optional; if omitted, derived from filename)
+  - Saves to `/data/jobs/<uuid>/model.inp`, estimates runtime/credits.
+  - Response: `{ "alias": "Beam_Test", "estimated_credits": 12.34, "estimated_time_s": 240 }`
+  - Validates upload size (`UPLOAD_LIMIT_GB`) and credits (returns 402 if insufficient).
+
+- Start a pending simulation: `POST /api/simulations/start`
+  - Body: `{ "alias": "Beam_Test" }`
+  - Charges credits (unless admin/unlimited), launches CalculiX (`ccx -nt $CCX_THREADS`) asynchronously.
+  - Response: `{ "status": "started", "alias": "Beam_Test" }`
+
+- Status by alias: `GET /api/simulations/status?alias=Beam%20Test`
+  - Response: `{ "alias": "Beam_Test", "status": "pending|running|finished|cancelled", "progress": 0..1, "started_at": "...", "estimated_time_s": 240 }`
+
+- List simulations (current user): `GET /api/simulations/list`
+  - Response: array of `{ id, owner_id, status, alias, created_at, updated_at }`.
+
+- Download results as ZIP by alias: `GET /api/simulations/load?alias=Beam%20Test`
+  - Responds with `application/zip` containing `.frd`, `.dat`, `solver.log`, etc.
+  - Example: `curl -fSL -H "Authorization: Bearer $TOKEN" -G --data-urlencode "alias=Beam Test" -OJ http://localhost:8080/api/simulations/load`
+
+Legacy/utility routes
+- Download by job id (ZIP): `GET /download/:id` (auth required; used by UI download button)
+- Job upload/management routes exist under the legacy, cookie‑auth namespace and are still used by the UI; prefer the `/api/simulations/*` routes for automation.
+
+Admin
+- Settings, users, SMTP, and benchmark endpoints are available under `/api/admin/*` (admin token required). Examples:
+  - `GET /api/admin/users`
+  - `POST /api/admin/users/:id/credits`
+  - `GET /api/admin/benchmark`
+  - `POST /api/admin/benchmark/run`
+
+Environment relevant to API
+- `JWT_SECRET`: secret for signing tokens (required in production)
+- `JWT_TTL_SECONDS`: token lifetime in seconds (default: 86400)
+- `CCX_THREADS`: threads used for CalculiX `-nt` (default: 8)
+- `UPLOAD_LIMIT_GB`: maximum upload size checked during `send`
+
+Curl cheat‑sheet
+- Login: `TOKEN=$(curl -sS http://localhost:8080/api/auth/login -H 'Content-Type: application/json' --data '{"email":"admin@mail.com","password":"admin"}' | jq -r .access_token)`
+- Send: `curl -fSL -H "Authorization: Bearer $TOKEN" -F alias="Beam Test" -F file=@model.inp http://localhost:8080/api/simulations/send`
+- Start: `curl -fSL -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data '{"alias":"Beam Test"}' http://localhost:8080/api/simulations/start`
+- Status: `curl -fSL -H "Authorization: Bearer $TOKEN" -G --data-urlencode alias="Beam Test" http://localhost:8080/api/simulations/status`
+- Download ZIP: `curl -fSL -H "Authorization: Bearer $TOKEN" -G --data-urlencode alias="Beam Test" -OJ http://localhost:8080/api/simulations/load`
 
 ---
 

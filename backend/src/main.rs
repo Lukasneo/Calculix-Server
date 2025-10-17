@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    io::ErrorKind,
+    io::{Cursor, ErrorKind},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -11,8 +11,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::multipart::Field;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{multipart::Field, DefaultBodyLimit, Query};
 use axum::{
     async_trait,
     body::{Body, Bytes},
@@ -51,7 +50,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
-use zip::write::FileOptions;
+use walkdir::WalkDir;
+use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
 #[derive(Clone)]
 struct AppState {
@@ -784,6 +784,15 @@ struct JobEstimateResponse {
     element_count: usize,
     benchmark_score: f64,
     charged_credits: f64,
+}
+
+#[derive(Serialize)]
+struct JobStatusResponse {
+    alias: String,
+    status: String,
+    progress: f64,
+    started_at: String,
+    estimated_time_s: f64,
 }
 
 #[derive(Serialize)]
@@ -1666,6 +1675,9 @@ async fn main() -> Result<()> {
         .nest("/profile", profile_router)
         .nest("/admin", admin_router)
         .nest("/settings", public_settings_router)
+        .route("/simulations/status", get(get_simulation_status))
+        .route("/simulations/list", get(list_simulations))
+        .route("/simulations/load", get(get_simulation_load))
         .merge(
             Router::new()
                 .route("/jobs/:id/estimate", get(estimate_job_credits))
@@ -3471,24 +3483,104 @@ async fn download(
     Ok((headers, body).into_response())
 }
 
-fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    {
-        let mut writer = zip::ZipWriter::new(&mut cursor);
-        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for entry in std::fs::read_dir(job_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                writer.start_file(file_name, options)?;
-                let mut file = std::fs::File::open(&path)?;
-                std::io::copy(&mut file, &mut writer)?;
-            }
-        }
-        writer.finish()?;
+async fn get_simulation_load(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let alias = params
+        .get("alias")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("Alias parameter is required"))?;
+
+    let jobs = state.jobs.read().await;
+
+    let job = jobs
+        .values()
+        .find(|job| job.owner_id == auth.user_id && job.alias == *alias)
+        .cloned()
+        .ok_or_else(|| AppError::not_found("Job Not Found"))?;
+
+    if job.owner_id != auth.user_id {
+        return Err(AppError::forbidden("Forbidden"));
     }
 
+    drop(jobs);
+
+    if !job.done {
+        return Err(AppError::bad_request("Job is not finished yet"));
+    }
+
+    let zip_bytes = tokio::task::spawn_blocking(move || create_results_archive(&job.job_dir))
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to join archive task: {e}")))?
+        .map_err(|e| AppError::internal(format!("Failed to create archive: {e}")))?;
+
+    let filename = format!("{}.zip", job.alias);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/zip".parse().unwrap());
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{}\"", filename)
+            .parse()
+            .unwrap(),
+    );
+
+    let body = Bytes::from(zip_bytes);
+    info!(
+        "User {} downloaded ZIP archive for job {}",
+        auth.user_id, job.id
+    );
+
+    Ok((headers, body).into_response())
+}
+
+fn create_results_archive(job_dir: &Path) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(cursor);
+    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    for entry in WalkDir::new(job_dir) {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to read contents while creating archive for {}",
+                job_dir.display()
+            )
+        })?;
+
+        let path = entry.path();
+        let relative = path.strip_prefix(job_dir).with_context(|| {
+            format!(
+                "Failed to derive relative path for {} within {}",
+                path.display(),
+                job_dir.display()
+            )
+        })?;
+
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let name = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if entry.file_type().is_dir() {
+            zip.add_directory(name, options)?;
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            zip.start_file(name, options)?;
+            let mut file = std::fs::File::open(path)?;
+            std::io::copy(&mut file, &mut zip)?;
+        }
+    }
+
+    let cursor = zip.finish()?;
     Ok(cursor.into_inner())
 }
 
@@ -3511,6 +3603,96 @@ fn resolve_upload_limit_bytes() -> Result<usize> {
     }
 
     Ok(bytes as usize)
+}
+
+async fn get_simulation_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<JobStatusResponse>, AppError> {
+    let alias = params
+        .get("alias")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("Alias parameter is required"))?;
+
+    let jobs = state.jobs.read().await;
+
+    let job = jobs
+        .values()
+        .find(|job| job.owner_id == auth.user_id && job.alias == *alias)
+        .cloned()
+        .ok_or_else(|| AppError::not_found("Job Not Found"))?;
+
+    if job.owner_id != auth.user_id {
+        return Err(AppError::forbidden("Forbidden"));
+    }
+
+    let status = if job.running {
+        "running".to_string()
+    } else if job.done {
+        "finished".to_string()
+    } else if job.cancelled {
+        "cancelled".to_string()
+    } else {
+        "pending".to_string()
+    };
+
+    let progress = if job.done {
+        1.0
+    } else {
+        calculate_progress_from_log(&job.log_path)
+            .await
+            .unwrap_or(0.0)
+    };
+
+    Ok(Json(JobStatusResponse {
+        alias: job.alias.clone(),
+        status,
+        progress,
+        started_at: job.started_at.to_rfc3339(),
+        estimated_time_s: job.estimated_runtime_seconds,
+    }))
+}
+
+async fn calculate_progress_from_log(log_path: &Path) -> Result<f64, AppError> {
+    let content = match fs::read_to_string(log_path).await {
+        Ok(content) => content,
+        Err(_) => return Ok(0.0),
+    };
+
+    let mut max_line = 0.0;
+
+    for line in content.lines() {
+        if line.contains("PERCENT COMPLETE") {
+            let parts: Vec<&str> = line.split("PERCENT COMPLETE").collect();
+
+            if parts.len() > 1 {
+                let number_str = parts[0].trim();
+
+                match number_str.parse::<f64>() {
+                    Ok(number) => {
+                        if number > max_line {
+                            max_line = number;
+                        }
+                    }
+                    Err(_) => {
+                        println!("Failed to parse number from line: {}", line);
+                    }
+                }
+            }
+        }
+    }
+
+    if max_line > 0.0 {
+        if max_line > 100.0 {
+            return Ok(1.0);
+        } else {
+            return Ok(max_line / 100.0);
+        }
+    } else {
+        return Ok(0.0);
+    }
 }
 
 #[cfg(test)]

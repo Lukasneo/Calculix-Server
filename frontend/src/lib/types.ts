@@ -15,6 +15,27 @@ export interface AdminUser extends SessionUser {
 
 export interface AppSettings {
 	allow_signups: boolean;
+	mail_base_url: string | null;
+}
+
+export interface SmtpSettings {
+	host: string;
+	port: number;
+	username: string | null;
+	password: string | null;
+	from_address: string;
+	use_tls: boolean;
+}
+
+export type MailStatus = 'sent' | 'failed';
+
+export interface MailLogEntry {
+	timestamp: string;
+	to: string;
+	subject: string;
+	template: string;
+	status: MailStatus;
+	error?: string | null;
 }
 
 export interface UserCredits {
